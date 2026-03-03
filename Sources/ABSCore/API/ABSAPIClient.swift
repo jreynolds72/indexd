@@ -2,7 +2,7 @@ import Foundation
 import os
 
 public actor ABSAPIClient {
-    private let logger = Logger(subsystem: "ABSClient", category: "API")
+    private let logger = Logger(subsystem: "indexd", category: "API")
     private let baseURL: URL
     private let httpClient: HTTPClient
     private let authSession: AuthSession

@@ -55,7 +55,7 @@ public final class UserDefaultsPlaybackSpeedStore: PlaybackSpeedStoring {
     private let userDefaults: UserDefaults
 
     public init(
-        key: String = "com.absclient.playback.rate",
+        key: String = "com.indexd.playback.rate",
         userDefaults: UserDefaults = .standard
     ) {
         self.key = key

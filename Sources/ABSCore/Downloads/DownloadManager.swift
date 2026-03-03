@@ -59,7 +59,7 @@ public actor DownloadManager {
         if let storageDirectory {
             rootDirectory = storageDirectory
         } else if let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
-            rootDirectory = appSupport.appendingPathComponent("ABSClient", isDirectory: true)
+            rootDirectory = appSupport.appendingPathComponent("indexd", isDirectory: true)
         } else {
             throw DownloadError.invalidStorageDirectory
         }

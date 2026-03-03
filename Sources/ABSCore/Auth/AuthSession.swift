@@ -115,6 +115,6 @@ public actor AuthSession {
     }
 
     private static func serviceName(for serverURL: URL) -> String {
-        "com.absclient.auth.\(serverURL.host ?? serverURL.absoluteString)"
+        "com.indexd.auth.\(serverURL.host ?? serverURL.absoluteString)"
     }
 }

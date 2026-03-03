@@ -86,9 +86,9 @@ public actor SyncEngine {
         if let storageDirectory {
             baseDirectory = storageDirectory
         } else if let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
-            baseDirectory = appSupport.appendingPathComponent("ABSClient", isDirectory: true)
+            baseDirectory = appSupport.appendingPathComponent("indexd", isDirectory: true)
         } else {
-            baseDirectory = fileManager.temporaryDirectory.appendingPathComponent("ABSClient", isDirectory: true)
+            baseDirectory = fileManager.temporaryDirectory.appendingPathComponent("indexd", isDirectory: true)
         }
 
         try fileManager.createDirectory(at: baseDirectory, withIntermediateDirectories: true)

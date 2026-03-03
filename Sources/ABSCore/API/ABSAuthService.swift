@@ -2,7 +2,7 @@ import Foundation
 import os
 
 public actor ABSAuthService: AuthServicing {
-    private let logger = Logger(subsystem: "ABSClient", category: "Auth")
+    private let logger = Logger(subsystem: "indexd", category: "Auth")
     private let httpClient: HTTPClient
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()

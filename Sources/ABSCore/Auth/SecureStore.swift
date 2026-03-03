@@ -95,7 +95,7 @@ public final class UserDefaultsSecureStore: SecureStoring, @unchecked Sendable {
     private let namespace: String
 
     public init(
-        suiteName: String = "ABSClient.DevSecureStore",
+        suiteName: String = "indexd.DevSecureStore",
         namespace: String = "dev.securestore"
     ) {
         self.userDefaults = UserDefaults(suiteName: suiteName) ?? .standard
