@@ -158,6 +158,7 @@ struct ContentView: View {
         case recent = "Recent"
         case favorites = "Favorites"
         case books = "Books"
+        case downloaded = "Downloaded"
     }
 
     private enum BookSortOption: String, CaseIterable, Identifiable {
@@ -192,6 +193,7 @@ struct ContentView: View {
     private let favoritesDefaultsKey = "abs.local.favorites.v1"
     private let recentDefaultsKey = "abs.local.recent.v1"
     private let searchSuggestionLimit = 5
+    private let downloadMenuPageSize = 8
     private let libraryBrowseTabs: [LibraryBrowseTab] = [
         .authors,
         .narrators,
@@ -200,13 +202,15 @@ struct ContentView: View {
         .continueListening,
         .recent,
         .favorites,
-        .books
+        .books,
+        .downloaded
     ]
 
     @EnvironmentObject private var preferences: AppPreferences
     @Environment(\.openWindow) private var openWindow
     @StateObject private var viewModel = AppViewModel()
     @State private var selectedItemID: ABSCore.LibraryItem.ID?
+    @State private var selectedItemIDs: Set<ABSCore.LibraryItem.ID> = []
     @State private var selectedGroupID: String?
     @State private var searchText = ""
     @State private var itemFilter: ItemFilterOption = .all
@@ -239,6 +243,20 @@ struct ContentView: View {
     @State private var progressHistoryByItemID: [String: [ProgressHistoryEntry]] = [:]
     @State private var favoriteItemIDs: Set<String> = []
     @State private var recentActivityByItemID: [String: Date] = [:]
+    @State private var downloadedItemIDs: Set<String> = []
+    @State private var downloadStateByItemID: [String: DownloadState] = [:]
+    @State private var downloadBusyItemIDs: Set<String> = []
+    @State private var downloadQueuedItemIDs: Set<String> = []
+    @State private var downloadProgressByItemID: [String: Double] = [:]
+    @State private var isClearingDownloads = false
+    @State private var downloadMenuPage = 0
+    @State private var showingDownloadsPopover = false
+    @State private var downloadPopoverWidth: CGFloat = 720
+    @State private var downloadPopoverHeight: CGFloat = 560
+    @State private var downloadPopoverDragStartWidth: CGFloat?
+    @State private var downloadPopoverDragStartHeight: CGFloat?
+    @State private var showingItemDownloadPopover = false
+    @State private var showingBulkActionsPopover = false
     @State private var isTimelineScrubbing = false
     @State private var scrubPreviewSeconds: TimeInterval?
     @State private var progressHydrationTask: Task<Void, Never>?
@@ -300,6 +318,22 @@ struct ContentView: View {
                     }
                     .disabled(!viewModel.isAuthenticated)
                 }
+            }
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    showingDownloadsPopover.toggle()
+                } label: {
+                    HStack(spacing: 4) {
+                        downloadToolbarLabel
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                }
+                .buttonStyle(.bordered)
+                .popover(isPresented: $showingDownloadsPopover, arrowEdge: .top) {
+                    downloadsPopoverContent
+                }
+                .help("Downloads")
             }
             ToolbarItem(placement: .automatic) {
                 Menu {
@@ -424,6 +458,7 @@ struct ContentView: View {
         view = AnyView(view.task {
             await viewModel.bootstrap()
             loadLocalPlaybackMetadata()
+            await refreshDownloadedInventory()
             showingServerSheet = !viewModel.isAuthenticated
             if viewModel.selectedLibraryID == nil {
                 viewModel.selectedLibraryID = viewModel.libraries.first?.id
@@ -431,7 +466,7 @@ struct ContentView: View {
             if let selectedLibraryID = viewModel.selectedLibraryID, browseTabByLibraryID[selectedLibraryID] == nil {
                 browseTabByLibraryID[selectedLibraryID] = .books
             }
-            if currentBrowseTab == .books {
+            if isBookListTab {
                 selectedItemID = browsedItems.first?.id
                 selectedGroupID = nil
             } else {
@@ -445,6 +480,7 @@ struct ContentView: View {
                 await viewModel.refreshDetailsForSelectedItem(itemID: selectedItemID)
                 await syncSelectedItemProgressFromServer()
                 scheduleProgressHydration()
+                await refreshDownloadStates(for: viewModel.displayedItems.map(\.id))
                 await preloadChaptersForSelectedItem(adoptForPlayback: activeItemID == nil)
                 await preloadCoverForSelectedItem()
                 await preloadCoverForPlaybackItem()
@@ -478,7 +514,7 @@ struct ContentView: View {
         })
 
         view = AnyView(view.onChange(of: viewModel.selectedLibraryID, perform: { _ in
-            if currentBrowseTab == .books {
+            if isBookListTab {
                 selectedItemID = browsedItems.first?.id
                 selectedGroupID = nil
             } else {
@@ -489,6 +525,9 @@ struct ContentView: View {
             isPlaying = false
             updateNowPlaying()
             scheduleProgressHydration()
+            Task {
+                await refreshDownloadStates(for: viewModel.displayedItems.map(\.id))
+            }
         }))
 
         view = AnyView(view.onChange(of: selectedItemID, perform: { _ in
@@ -508,6 +547,10 @@ struct ContentView: View {
 
         view = AnyView(view.onChange(of: viewModel.displayedItems.map(\.id), perform: { _ in
             scheduleProgressHydration()
+            Task {
+                await refreshDownloadedInventory()
+                await refreshDownloadStates(for: viewModel.displayedItems.map(\.id))
+            }
         }))
 
         view = AnyView(view.onChange(of: playbackDisplayItem?.id, perform: { _ in
@@ -770,7 +813,7 @@ struct ContentView: View {
                 Text("Sort")
                     .foregroundStyle(.secondary)
                 Picker("Sort", selection: sortPickerSelectionBinding) {
-                    if currentBrowseTab == .books {
+                    if isBookListTab {
                         ForEach(BookSortOption.allCases) { option in
                             Text(option.rawValue).tag(option.rawValue)
                         }
@@ -796,7 +839,33 @@ struct ContentView: View {
                 .labelsHidden()
             }
 
+            if currentBrowseTab == .downloaded {
+                Button("Open Cache") {
+                    Task { await openDownloadCacheInFinder() }
+                }
+
+                Button(isClearingDownloads ? "Clearing…" : "Clear Downloads", role: .destructive) {
+                    Task { await clearAllDownloads() }
+                }
+                .disabled(isClearingDownloads || downloadedItemIDs.isEmpty)
+            }
+
             Spacer()
+
+            if isBookListTab {
+                Button {
+                    showingBulkActionsPopover.toggle()
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.headline.weight(.semibold))
+                        .frame(width: 22, height: 20)
+                }
+                .buttonStyle(.bordered)
+                .help("Bulk actions")
+                .popover(isPresented: $showingBulkActionsPopover, arrowEdge: .top) {
+                    bulkActionsPopoverContent
+                }
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -806,10 +875,10 @@ struct ContentView: View {
     private var sortPickerSelectionBinding: Binding<String> {
         Binding<String>(
             get: {
-                currentBrowseTab == .books ? bookSortOption.rawValue : groupSortOption.rawValue
+                isBookListTab ? bookSortOption.rawValue : groupSortOption.rawValue
             },
             set: { newValue in
-                if currentBrowseTab == .books {
+                if isBookListTab {
                     if let option = BookSortOption(rawValue: newValue) {
                         bookSortOption = option
                     }
@@ -827,7 +896,7 @@ struct ContentView: View {
     }
 
     private var visibleItemCount: Int {
-        if currentBrowseTab == .books {
+        if isBookListTab {
             return browsedItems.count
         }
 
@@ -836,7 +905,7 @@ struct ContentView: View {
 
     @ViewBuilder
     private var itemListContent: some View {
-        if currentBrowseTab == .books {
+        if isBookListTab {
             booksListView
         } else {
             groupListView
@@ -844,8 +913,10 @@ struct ContentView: View {
     }
 
     private var booksListView: some View {
-        List(browsedItems, selection: $selectedItemID) { item in
+        List(browsedItems, selection: booksListSelectionBinding) { item in
             HStack(spacing: 8) {
+                itemListRowCover(for: item)
+
                 VStack(alignment: .leading, spacing: 4) {
                     Text(item.title)
                         .font(.headline)
@@ -869,35 +940,110 @@ struct ContentView: View {
             .padding(.vertical, 2)
             .tag(item.id)
             .contextMenu {
-                Button("Start from Beginning") {
-                    selectedItemID = item.id
-                    play(item: item, startPosition: 0, forceReload: true)
-                }
+                let contextItemIDs = contextSelectionIDs(for: item.id)
+                let contextAllFavorited = contextItemIDs.allSatisfy { favoriteItemIDs.contains($0) }
 
-                if hasSavedProgress(for: item.id) {
-                    let resumePosition = savedProgress(for: item.id)
-                    Button("Resume at \(formattedClock(resumePosition))") {
+                if contextItemIDs.count > 1 {
+                    Button("Download Selected to App Cache (\(contextItemIDs.count))") {
+                        Task { await downloadItems(contextItemIDs) }
+                    }
+
+                    Button("Remove Downloaded Files (\(contextSelectedDownloadedItemIDs(for: item.id).count))", role: .destructive) {
+                        Task { await removeDownloads(contextItemIDs) }
+                    }
+                    .disabled(contextSelectedDownloadedItemIDs(for: item.id).isEmpty)
+
+                    if contextAllFavorited {
+                        Button("Unfavorite Selected (\(contextItemIDs.count))") {
+                            setFavorite(for: contextItemIDs, isFavorite: false)
+                        }
+                    } else {
+                        Button("Favorite Selected (\(contextItemIDs.count))") {
+                            setFavorite(for: contextItemIDs, isFavorite: true)
+                        }
+                    }
+                } else {
+                    Button("Start from Beginning") {
                         selectedItemID = item.id
-                        play(item: item, startPosition: resumePosition)
+                        selectedItemIDs = [item.id]
+                        play(item: item, startPosition: 0, forceReload: true)
+                    }
+
+                    if hasSavedProgress(for: item.id) {
+                        let resumePosition = savedProgress(for: item.id)
+                        Button("Resume at \(formattedClock(resumePosition))") {
+                            selectedItemID = item.id
+                            selectedItemIDs = [item.id]
+                            play(item: item, startPosition: resumePosition)
+                        }
+                    }
+
+                    Divider()
+
+                    Button(favoriteItemIDs.contains(item.id) ? "Unfavorite" : "Favorite") {
+                        toggleFavorite(itemID: item.id)
+                    }
+
+                    Button("Clear Progress") {
+                        clearSavedProgressEverywhere(item: item)
+                    }
+                    .disabled(!hasSavedProgress(for: item.id))
+
+                    Divider()
+
+                    Menu("Download…") {
+                        Button(downloadBusyItemIDs.contains(item.id) ? "Downloading to App Cache…" : "Download to App Cache") {
+                            Task { await downloadItem(item.id) }
+                        }
+                        .disabled(downloadBusyItemIDs.contains(item.id))
+
+                        Button("Download To…") {
+                            Task { await downloadItemToChosenLocation(item: item) }
+                        }
+                        .disabled(downloadBusyItemIDs.contains(item.id))
+
+                        Button("Open Download Cache in Finder") {
+                            Task { await openDownloadCacheInFinder() }
+                        }
+
+                        if downloadState(for: item.id) == .downloaded {
+                            Divider()
+                            Button("Remove Downloaded File", role: .destructive) {
+                                Task { await removeDownload(for: item.id) }
+                            }
+                        }
                     }
                 }
-
-                Divider()
-
-                Button(favoriteItemIDs.contains(item.id) ? "Unfavorite" : "Favorite") {
-                    toggleFavorite(itemID: item.id)
-                }
-
-                Button("Clear Progress") {
-                    clearSavedProgressEverywhere(item: item)
-                }
-                .disabled(!hasSavedProgress(for: item.id))
             }
             .onTapGesture(count: 2) {
                 selectedItemID = item.id
+                selectedItemIDs = [item.id]
                 let resumePosition = savedProgress(for: item.id)
                 play(item: item, startPosition: resumePosition > 0 ? resumePosition : nil)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func itemListRowCover(for item: ABSCore.LibraryItem) -> some View {
+        if let cover = coverImagesByItemID[item.id] {
+            Image(nsImage: cover)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 44, height: 44)
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+        } else {
+            RoundedRectangle(cornerRadius: 7)
+                .fill(Color.secondary.opacity(0.18))
+                .frame(width: 44, height: 44)
+                .overlay {
+                    Image(systemName: "book.closed")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .onAppear {
+                    Task { await preloadCoverForItemID(item.id) }
+                }
         }
     }
 
@@ -932,7 +1078,7 @@ struct ContentView: View {
             nowPlayingDetailView(item: item)
                 .navigationTitle("Now Playing")
                 .transition(.move(edge: .trailing).combined(with: .opacity))
-        } else if currentBrowseTab != .books, let group = selectedGroup {
+        } else if !isBookListTab, let group = selectedGroup {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     VStack(alignment: .leading, spacing: 6) {
@@ -1072,14 +1218,33 @@ struct ContentView: View {
                                 .multilineTextAlignment(.center)
                         }
 
-                        Button {
-                            let resumePosition = savedProgress(for: item.id)
-                            play(item: item, startPosition: resumePosition > 0 ? resumePosition : nil)
-                        } label: {
-                            Label("Play", systemImage: "play.fill")
-                                .font(.headline)
+                        HStack(spacing: 10) {
+                            Button {
+                                let resumePosition = savedProgress(for: item.id)
+                                play(item: item, startPosition: resumePosition > 0 ? resumePosition : nil)
+                            } label: {
+                                Label("Play", systemImage: "play.fill")
+                                    .font(.headline)
+                                    .frame(minWidth: 120)
+                            }
+                            .buttonStyle(.borderedProminent)
+
+                            Button {
+                                showingItemDownloadPopover.toggle()
+                            } label: {
+                                let isDownloaded = downloadedItemIDs.contains(item.id) || downloadStateByItemID[item.id] == .downloaded
+                                Image(systemName: "arrow.down")
+                                    .font(.headline.weight(.semibold))
+                                    .foregroundStyle(isDownloaded ? Color.green : Color.primary)
+                                    .frame(width: 28, height: 22)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.bordered)
+                            .popover(isPresented: $showingItemDownloadPopover, arrowEdge: .top) {
+                                itemDownloadPopoverContent(item: item)
+                            }
                         }
-                        .buttonStyle(.borderedProminent)
+                        .frame(maxWidth: .infinity, alignment: .center)
 
                         Divider()
 
@@ -1668,9 +1833,10 @@ struct ContentView: View {
     }
 
     private var selectedItem: ABSCore.LibraryItem? {
-        guard let selectedItemID else { return nil }
-        return browsedItems.first { $0.id == selectedItemID }
-            ?? viewModel.displayedItems.first { $0.id == selectedItemID }
+        let resolvedID = selectedItemID ?? selectedVisibleItemIDs.first
+        guard let resolvedID else { return nil }
+        return browsedItems.first { $0.id == resolvedID }
+            ?? viewModel.displayedItems.first { $0.id == resolvedID }
     }
 
     private var selectedGroup: BrowseGroup? {
@@ -1751,6 +1917,8 @@ struct ContentView: View {
         switch currentBrowseTab {
         case .books:
             return sortedBooks(items)
+        case .downloaded:
+            return sortedBooks(items.filter { downloadedItemIDs.contains($0.id) })
         case .authors:
             return sortedBooks(items.sorted {
                 let lhsAuthor = ($0.author ?? "Unknown Author").localizedLowercase
@@ -1835,10 +2003,16 @@ struct ContentView: View {
         return browseTabByLibraryID[selectedLibraryID] ?? .books
     }
 
+    private var isBookListTab: Bool {
+        currentBrowseTab == .books || currentBrowseTab == .downloaded
+    }
+
     private var browseGroups: [BrowseGroup] {
         let items = filteredBaseItems
         switch currentBrowseTab {
         case .books:
+            return []
+        case .downloaded:
             return []
         case .authors:
             return groupedRowsForPeople(items, names: authorNames(for:), unknownLabel: "Unknown Author")
@@ -1884,12 +2058,14 @@ struct ContentView: View {
 
         Task {
             await viewModel.selectLibrary(id: libraryID)
-            if browseTab == .books {
+            if browseTab == .books || browseTab == .downloaded {
                 selectedItemID = browsedItems.first?.id
+                selectedItemIDs = selectedItemID.map { [$0] } ?? []
                 selectedGroupID = nil
             } else {
                 selectedGroupID = displayedBrowseGroups.first?.id
                 selectedItemID = nil
+                selectedItemIDs = []
             }
         }
     }
@@ -1904,12 +2080,22 @@ struct ContentView: View {
 
         selectCurrentLibraryBrowseTab(tab)
         selectedItemID = nil
+        selectedItemIDs = []
         let groups = displayedBrowseGroups
         if groups.contains(where: { $0.id == groupID }) {
             selectedGroupID = groupID
         } else {
             selectedGroupID = groups.first?.id
         }
+    }
+
+    private func openItemFromDownloadsPopover(_ itemID: String) {
+        guard viewModel.selectedLibraryID != nil else { return }
+        selectCurrentLibraryBrowseTab(.books)
+        selectedGroupID = nil
+        selectedItemID = itemID
+        selectedItemIDs = [itemID]
+        showingDownloadsPopover = false
     }
 
     private var filteredBaseItems: [ABSCore.LibraryItem] {
@@ -1996,9 +2182,17 @@ struct ContentView: View {
     }
 
     private func refreshSelectionForCurrentBrowseContext() {
-        if currentBrowseTab == .books {
+        if isBookListTab {
+            let visibleIDs = Set(browsedItems.map(\.id))
+            selectedItemIDs = selectedItemIDs.intersection(visibleIDs)
+            if let selectedItemID, !visibleIDs.contains(selectedItemID) {
+                self.selectedItemID = nil
+            }
             if selectedItem == nil {
                 selectedItemID = browsedItems.first?.id
+                selectedItemIDs = selectedItemID.map { [$0] } ?? []
+            } else if selectedItemIDs.isEmpty, let selectedItemID {
+                selectedItemIDs = [selectedItemID]
             }
             selectedGroupID = nil
         } else {
@@ -2006,7 +2200,106 @@ struct ContentView: View {
                 selectedGroupID = displayedBrowseGroups.first?.id
             }
             selectedItemID = nil
+            selectedItemIDs = []
         }
+    }
+
+    private var booksListSelectionBinding: Binding<Set<String>> {
+        Binding(
+            get: { selectedItemIDs },
+            set: { newSelection in
+                selectedItemIDs = newSelection
+                if let selectedItemID, newSelection.contains(selectedItemID) {
+                    return
+                }
+                selectedItemID = newSelection.first
+            }
+        )
+    }
+
+    private var selectedVisibleItemIDs: [String] {
+        let visibleIDs = Set(browsedItems.map(\.id))
+        let ids = selectedItemIDs.filter { visibleIDs.contains($0) }
+        if !ids.isEmpty {
+            return ids.sorted()
+        }
+        if let selectedItemID, visibleIDs.contains(selectedItemID) {
+            return [selectedItemID]
+        }
+        return []
+    }
+
+    private var allSelectedVisibleItemsFavorited: Bool {
+        let ids = selectedVisibleItemIDs
+        guard !ids.isEmpty else { return false }
+        return ids.allSatisfy { favoriteItemIDs.contains($0) }
+    }
+
+    private func contextSelectionIDs(for rowItemID: String) -> [String] {
+        if selectedItemIDs.count > 1, selectedItemIDs.contains(rowItemID) {
+            return selectedVisibleItemIDs
+        }
+        return [rowItemID]
+    }
+
+    private func contextSelectedDownloadedItemIDs(for rowItemID: String) -> [String] {
+        contextSelectionIDs(for: rowItemID).filter { downloadedItemIDs.contains($0) }
+    }
+
+    private var selectedDownloadedItemIDs: [String] {
+        selectedVisibleItemIDs.filter { downloadedItemIDs.contains($0) }
+    }
+
+    private var bulkActionsPopoverContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button("Select All Visible (\(browsedItems.count))") {
+                selectedItemIDs = Set(browsedItems.map(\.id))
+                if selectedItemID == nil {
+                    selectedItemID = browsedItems.first?.id
+                }
+                showingBulkActionsPopover = false
+            }
+            .disabled(browsedItems.isEmpty)
+
+            Button("Clear Selection") {
+                selectedItemIDs = []
+                selectedItemID = nil
+                showingBulkActionsPopover = false
+            }
+            .disabled(selectedVisibleItemIDs.isEmpty)
+
+            Divider()
+
+            Button("Download Selected to App Cache (\(selectedVisibleItemIDs.count))") {
+                let ids = selectedVisibleItemIDs
+                showingBulkActionsPopover = false
+                Task { await downloadItems(ids) }
+            }
+            .disabled(selectedVisibleItemIDs.isEmpty)
+
+            Button("Remove Downloaded Files (\(selectedDownloadedItemIDs.count))", role: .destructive) {
+                let ids = selectedVisibleItemIDs
+                showingBulkActionsPopover = false
+                Task { await removeDownloads(ids) }
+            }
+            .disabled(selectedDownloadedItemIDs.isEmpty)
+
+            if allSelectedVisibleItemsFavorited {
+                Button("Unfavorite Selected (\(selectedVisibleItemIDs.count))") {
+                    setFavorite(for: selectedVisibleItemIDs, isFavorite: false)
+                    showingBulkActionsPopover = false
+                }
+                .disabled(selectedVisibleItemIDs.isEmpty)
+            } else {
+                Button("Favorite Selected (\(selectedVisibleItemIDs.count))") {
+                    setFavorite(for: selectedVisibleItemIDs, isFavorite: true)
+                    showingBulkActionsPopover = false
+                }
+                .disabled(selectedVisibleItemIDs.isEmpty)
+            }
+        }
+        .padding(12)
+        .frame(width: 290, alignment: .leading)
     }
 
     private func inferredSeriesName(for item: ABSCore.LibraryItem) -> String {
@@ -2439,6 +2732,297 @@ struct ContentView: View {
         .allowsHitTesting(false)
     }
 
+    private var hasActiveDownloads: Bool {
+        !downloadBusyItemIDs.isEmpty
+    }
+
+    private var downloadMenuItemIDs: [String] {
+        let allIDs = Set(downloadedItemIDs).union(downloadBusyItemIDs).union(downloadQueuedItemIDs)
+        return allIDs.sorted { lhs, rhs in
+            let lhsBusy = downloadBusyItemIDs.contains(lhs)
+            let rhsBusy = downloadBusyItemIDs.contains(rhs)
+            if lhsBusy != rhsBusy {
+                return lhsBusy && !rhsBusy
+            }
+            let lhsQueued = downloadQueuedItemIDs.contains(lhs)
+            let rhsQueued = downloadQueuedItemIDs.contains(rhs)
+            if lhsQueued != rhsQueued {
+                return lhsQueued && !rhsQueued
+            }
+            let lhsTitle = downloadDisplayTitle(for: lhs)
+            let rhsTitle = downloadDisplayTitle(for: rhs)
+            return lhsTitle.localizedCaseInsensitiveCompare(rhsTitle) == .orderedAscending
+        }
+    }
+
+    private func downloadDisplayTitle(for itemID: String) -> String {
+        guard let item = viewModel.item(withID: itemID) else { return itemID }
+        return item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? itemID : item.title
+    }
+
+    @ViewBuilder
+    private func downloadLinearProgressBar(progress: Double) -> some View {
+        let clamped = max(0, min(progress, 1))
+        GeometryReader { geometry in
+            let width = max(geometry.size.width, 0)
+            let fillWidth = max(4, width * clamped)
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.18))
+                Capsule()
+                    .fill(Color.orange)
+                    .frame(width: fillWidth)
+            }
+        }
+        .frame(height: 6)
+        .frame(maxWidth: 220)
+        .opacity(0.9)
+    }
+
+    private var downloadsPopoverContent: some View {
+        let itemIDs = downloadMenuItemIDs
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Downloads (\(itemIDs.count))")
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                Spacer()
+                Button("Go to Downloaded") {
+                    openDownloadedListFromDownloadsPopover()
+                }
+                .disabled(viewModel.selectedLibraryID == nil)
+            }
+
+            if itemIDs.isEmpty {
+                Text("No downloads yet")
+                    .foregroundStyle(.secondary)
+                    .font(.callout)
+                    .frame(maxHeight: .infinity, alignment: .topLeading)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(itemIDs.enumerated()), id: \.element) { index, itemID in
+                            if index > 0 {
+                                Divider()
+                                    .opacity(0.45)
+                            }
+                            Button {
+                                openItemFromDownloadsPopover(itemID)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text(downloadDisplayTitle(for: itemID))
+                                        .lineLimit(2)
+                                        .font(.subheadline)
+                                        .fontWeight(.semibold)
+                                        .foregroundStyle(.primary)
+
+                                    if let progress = downloadProgressByItemID[itemID] {
+                                        downloadLinearProgressBar(progress: progress)
+                                        Text("\(Int(max(0, min(progress, 1)) * 100))%")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    } else if downloadQueuedItemIDs.contains(itemID) {
+                                        Text("Queued")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    } else {
+                                        Text("Downloaded")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .padding(.vertical, 4)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .frame(maxHeight: .infinity, alignment: .top)
+            }
+
+            Divider()
+
+            HStack {
+                Button("Open Download Cache in Finder") {
+                    Task { await openDownloadCacheInFinder() }
+                }
+
+                Spacer()
+
+                if currentBrowseTab == .downloaded {
+                    Button(isClearingDownloads ? "Clearing…" : "Clear Downloads", role: .destructive) {
+                        Task { await clearAllDownloads() }
+                    }
+                    .disabled(isClearingDownloads || downloadedItemIDs.isEmpty)
+                }
+            }
+
+            HStack {
+                Spacer()
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 4)
+                    .background(Color.secondary.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { value in
+                                if downloadPopoverDragStartWidth == nil {
+                                    downloadPopoverDragStartWidth = downloadPopoverWidth
+                                }
+                                if downloadPopoverDragStartHeight == nil {
+                                    downloadPopoverDragStartHeight = downloadPopoverHeight
+                                }
+
+                                let startWidth = downloadPopoverDragStartWidth ?? downloadPopoverWidth
+                                let startOuterHeight = downloadPopoverDragStartHeight ?? downloadPopoverHeight
+                                let nextWidth = startWidth + value.translation.width
+                                let nextOuterHeight = startOuterHeight + value.translation.height
+                                var transaction = Transaction()
+                                transaction.disablesAnimations = true
+                                withTransaction(transaction) {
+                                    downloadPopoverWidth = min(max(nextWidth, 420), 1400)
+                                    downloadPopoverHeight = min(max(nextOuterHeight, 360), 980)
+                                }
+                            }
+                            .onEnded { _ in
+                                downloadPopoverDragStartWidth = nil
+                                downloadPopoverDragStartHeight = nil
+                            }
+                    )
+                    .onTapGesture(count: 2) {
+                        downloadPopoverWidth = 720
+                        downloadPopoverHeight = 560
+                    }
+            }
+        }
+        .padding(14)
+        .frame(width: downloadPopoverWidth, height: downloadPopoverHeight, alignment: .topLeading)
+        .animation(nil, value: downloadPopoverWidth)
+        .animation(nil, value: downloadPopoverHeight)
+    }
+
+    private func openDownloadedListFromDownloadsPopover() {
+        guard let currentLibraryID = viewModel.selectedLibraryID else { return }
+        browseTabByLibraryID[currentLibraryID] = .downloaded
+        selectedGroupID = nil
+        selectedItemID = browsedItems.first?.id
+        showingDownloadsPopover = false
+    }
+
+    private func itemDownloadPopoverContent(item: ABSCore.LibraryItem) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button(downloadBusyItemIDs.contains(item.id) ? "Downloading to App Cache…" : "Download to App Cache") {
+                showingItemDownloadPopover = false
+                Task { await downloadItem(item.id) }
+            }
+            .disabled(downloadBusyItemIDs.contains(item.id))
+
+            Button("Download To…") {
+                showingItemDownloadPopover = false
+                Task { await downloadItemToChosenLocation(item: item) }
+            }
+            .disabled(downloadBusyItemIDs.contains(item.id))
+
+            Button("Open Download Cache in Finder") {
+                showingItemDownloadPopover = false
+                Task { await openDownloadCacheInFinder() }
+            }
+
+            if downloadState(for: item.id) == .downloaded {
+                Divider()
+                Button("Remove Downloaded File", role: .destructive) {
+                    showingItemDownloadPopover = false
+                    Task { await removeDownload(for: item.id) }
+                }
+            }
+        }
+        .padding(12)
+        .frame(width: 280, alignment: .leading)
+    }
+
+    private var activeDownloadProgress: Double? {
+        guard hasActiveDownloads else { return nil }
+        let values = downloadBusyItemIDs.compactMap { downloadProgressByItemID[$0] }
+        guard !values.isEmpty else { return nil }
+        let mean = values.reduce(0, +) / Double(values.count)
+        let clamped = min(max(mean, 0), 1)
+        // Treat near-zero as indeterminate so UI still conveys "busy".
+        return clamped > 0.001 ? clamped : nil
+    }
+
+    private var downloadToolbarLabel: some View {
+        let progress = activeDownloadProgress
+        return Group {
+            if hasActiveDownloads {
+                let clamped = max(0.03, min(max(progress ?? 0.08, 0), 1))
+                let step = Int((clamped * 100).rounded())
+                Image(nsImage: downloadProgressIcon(progress: clamped))
+                    .interpolation(.none)
+                    .id("download-progress-\(step)")
+            } else {
+                Image(systemName: "arrow.down")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.primary)
+            }
+        }
+    }
+
+    private func downloadProgressIcon(progress: Double) -> NSImage {
+        let clamped = min(max(progress, 0), 1)
+        let size = NSSize(width: 22, height: 22)
+        let image = NSImage(size: size, flipped: false) { rect in
+            let center = NSPoint(x: rect.midX, y: rect.midY)
+            let radius: CGFloat = 8.8
+
+            let fillPath = NSBezierPath(
+                ovalIn: NSRect(
+                    x: center.x - radius,
+                    y: center.y - radius,
+                    width: radius * 2,
+                    height: radius * 2
+                )
+            )
+            NSColor.systemOrange.withAlphaComponent(0.16).setFill()
+            fillPath.fill()
+
+            let trackPath = NSBezierPath()
+            trackPath.appendArc(withCenter: center, radius: radius - 1, startAngle: 0, endAngle: 360, clockwise: false)
+            trackPath.lineWidth = 2.0
+            trackPath.lineCapStyle = .round
+            NSColor.systemOrange.withAlphaComponent(0.38).setStroke()
+            trackPath.stroke()
+
+            let progressPath = NSBezierPath()
+            let endAngle = CGFloat(90 - (360 * clamped))
+            progressPath.appendArc(withCenter: center, radius: radius - 1, startAngle: 90, endAngle: endAngle, clockwise: true)
+            progressPath.lineWidth = 2.8
+            progressPath.lineCapStyle = .round
+            NSColor.systemOrange.setStroke()
+            progressPath.stroke()
+
+            let arrowPath = NSBezierPath()
+            arrowPath.lineWidth = 1.8
+            arrowPath.lineCapStyle = .round
+            arrowPath.lineJoinStyle = .round
+            arrowPath.move(to: NSPoint(x: center.x, y: center.y + 3.6))
+            arrowPath.line(to: NSPoint(x: center.x, y: center.y - 1.6))
+            arrowPath.move(to: NSPoint(x: center.x - 2.9, y: center.y - 0.5))
+            arrowPath.line(to: NSPoint(x: center.x, y: center.y - 3.6))
+            arrowPath.line(to: NSPoint(x: center.x + 2.9, y: center.y - 0.5))
+            NSColor.white.withAlphaComponent(0.95).setStroke()
+            arrowPath.stroke()
+
+            return true
+        }
+        image.isTemplate = false
+        return image
+    }
+
     private func formattedDuration(_ seconds: TimeInterval?) -> String {
         guard let seconds else { return "Unknown" }
         let hours = Int(seconds) / 3600
@@ -2700,7 +3284,7 @@ struct ContentView: View {
                 if let selectedLibraryID = viewModel.selectedLibraryID, browseTabByLibraryID[selectedLibraryID] == nil {
                     browseTabByLibraryID[selectedLibraryID] = .books
                 }
-                if currentBrowseTab == .books {
+                if isBookListTab {
                     selectedItemID = browsedItems.first?.id
                     selectedGroupID = nil
                 } else {
@@ -2841,7 +3425,7 @@ struct ContentView: View {
                 let source: ProgressHistorySource? = abs(resolvedStart - localStart) > 0.5 ? .absServer : nil
                 persistProgress(itemID: item.id, seconds: resolvedStart, source: source)
 
-                let url = try await viewModel.streamURL(for: item.id)
+                let url = try await viewModel.playbackURL(for: item.id)
                 let newItem = AVPlayerItem(url: url)
                 player.replaceCurrentItem(with: newItem)
                 activeItemID = item.id
@@ -3000,6 +3584,144 @@ struct ContentView: View {
         }
     }
 
+    private func downloadState(for itemID: String) -> DownloadState {
+        if downloadBusyItemIDs.contains(itemID) {
+            return .downloading
+        }
+        if downloadQueuedItemIDs.contains(itemID) {
+            return .downloading
+        }
+        if let state = downloadStateByItemID[itemID] {
+            return state
+        }
+        return downloadedItemIDs.contains(itemID) ? .downloaded : .notDownloaded
+    }
+
+    private func refreshDownloadedInventory() async {
+        downloadedItemIDs = await viewModel.downloadedItemIDs()
+    }
+
+    private func refreshDownloadStates(for itemIDs: [String]) async {
+        let uniqueItemIDs = Array(Set(itemIDs))
+        guard !uniqueItemIDs.isEmpty else { return }
+
+        var updates: [String: DownloadState] = [:]
+        for itemID in uniqueItemIDs {
+            updates[itemID] = await viewModel.downloadState(for: itemID)
+        }
+        for (itemID, state) in updates {
+            downloadStateByItemID[itemID] = state
+        }
+    }
+
+    private func downloadItem(_ itemID: String) async {
+        guard !downloadBusyItemIDs.contains(itemID) else { return }
+        downloadQueuedItemIDs.remove(itemID)
+        downloadBusyItemIDs.insert(itemID)
+        downloadProgressByItemID[itemID] = 0
+        defer {
+            downloadBusyItemIDs.remove(itemID)
+            downloadProgressByItemID.removeValue(forKey: itemID)
+        }
+
+        do {
+            _ = try await viewModel.downloadItem(itemID: itemID, progress: { progress in
+                await MainActor.run {
+                    downloadProgressByItemID[itemID] = progress
+                }
+            })
+            downloadStateByItemID[itemID] = .downloaded
+            downloadedItemIDs.insert(itemID)
+        } catch {
+            viewModel.setError("Download failed: \(viewModel.describeError(error))")
+            await refreshDownloadStates(for: [itemID])
+        }
+    }
+
+    private func openDownloadCacheInFinder() async {
+        guard let cacheURL = await viewModel.downloadCacheDirectoryURL() else {
+            viewModel.setError("Download cache unavailable")
+            return
+        }
+
+        try? FileManager.default.createDirectory(at: cacheURL, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(cacheURL)
+    }
+
+    private func downloadItemToChosenLocation(item: ABSCore.LibraryItem) async {
+        guard !downloadBusyItemIDs.contains(item.id) else { return }
+        guard let directory = promptForDownloadDirectory() else { return }
+
+        downloadQueuedItemIDs.remove(item.id)
+        downloadBusyItemIDs.insert(item.id)
+        downloadProgressByItemID[item.id] = 0
+        defer {
+            downloadBusyItemIDs.remove(item.id)
+            downloadProgressByItemID.removeValue(forKey: item.id)
+        }
+
+        do {
+            let destination = try await viewModel.downloadItemToDirectory(
+                itemID: item.id,
+                directoryURL: directory,
+                progress: { progress in
+                    await MainActor.run {
+                        downloadProgressByItemID[item.id] = progress
+                    }
+                }
+            )
+            NSWorkspace.shared.activateFileViewerSelecting([destination])
+        } catch {
+            viewModel.setError("Download failed: \(viewModel.describeError(error))")
+        }
+    }
+
+    private func promptForDownloadDirectory() -> URL? {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        panel.title = "Select Download Location"
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
+    private func removeDownload(for itemID: String) async {
+        guard !downloadBusyItemIDs.contains(itemID) else { return }
+        downloadBusyItemIDs.insert(itemID)
+        defer { downloadBusyItemIDs.remove(itemID) }
+
+        do {
+            try await viewModel.removeDownloadedItem(itemID: itemID)
+            downloadStateByItemID[itemID] = .notDownloaded
+            downloadedItemIDs.remove(itemID)
+        } catch {
+            viewModel.setError("Failed removing download: \(viewModel.describeError(error))")
+        }
+    }
+
+    private func clearAllDownloads() async {
+        guard !isClearingDownloads else { return }
+        isClearingDownloads = true
+        defer { isClearingDownloads = false }
+
+        do {
+            try await viewModel.clearAllDownloads()
+            downloadedItemIDs.removeAll()
+            downloadQueuedItemIDs.removeAll()
+            downloadProgressByItemID.removeAll()
+            for itemID in downloadStateByItemID.keys {
+                downloadStateByItemID[itemID] = .notDownloaded
+            }
+            if currentBrowseTab == .downloaded {
+                selectedItemID = browsedItems.first?.id
+            }
+        } catch {
+            viewModel.setError("Failed clearing downloads: \(viewModel.describeError(error))")
+        }
+    }
+
     private func hydrateProgressFromServer(for items: [ABSCore.LibraryItem]) async {
         guard viewModel.isAuthenticated else { return }
 
@@ -3049,6 +3771,12 @@ struct ContentView: View {
         progressHistoryByItemID = [:]
         favoriteItemIDs = []
         recentActivityByItemID = [:]
+        downloadedItemIDs = []
+        downloadStateByItemID = [:]
+        downloadBusyItemIDs = []
+        downloadQueuedItemIDs = []
+        downloadProgressByItemID = [:]
+        isClearingDownloads = false
         UserDefaults.standard.removeObject(forKey: progressDefaultsKey)
         UserDefaults.standard.removeObject(forKey: progressHistoryDefaultsKey)
         UserDefaults.standard.removeObject(forKey: favoritesDefaultsKey)
@@ -3128,6 +3856,36 @@ struct ContentView: View {
         UserDefaults.standard.set(Array(favoriteItemIDs).sorted(), forKey: favoritesDefaultsKey)
     }
 
+    private func setFavorite(for itemIDs: [String], isFavorite: Bool) {
+        guard !itemIDs.isEmpty else { return }
+        for itemID in itemIDs {
+            if isFavorite {
+                favoriteItemIDs.insert(itemID)
+                markRecentActivity(itemID: itemID, force: true)
+            } else {
+                favoriteItemIDs.remove(itemID)
+            }
+        }
+        UserDefaults.standard.set(Array(favoriteItemIDs).sorted(), forKey: favoritesDefaultsKey)
+    }
+
+    private func downloadItems(_ itemIDs: [String]) async {
+        let ordered = Array(Set(itemIDs)).sorted()
+        let queuedNow = ordered.filter { !downloadBusyItemIDs.contains($0) && !downloadedItemIDs.contains($0) }
+        downloadQueuedItemIDs.formUnion(queuedNow)
+        for itemID in ordered {
+            await downloadItem(itemID)
+        }
+    }
+
+    private func removeDownloads(_ itemIDs: [String]) async {
+        let removable = Array(Set(itemIDs)).filter { downloadedItemIDs.contains($0) }.sorted()
+        guard !removable.isEmpty else { return }
+        for itemID in removable {
+            await removeDownload(for: itemID)
+        }
+    }
+
     private func markRecentActivity(itemID: String, force: Bool = false) {
         let now = Date()
         if !force, let previous = recentActivityByItemID[itemID], now.timeIntervalSince(previous) < 30 {
@@ -3177,7 +3935,7 @@ struct ContentView: View {
         }
 
         do {
-            let url = try await viewModel.streamURL(for: item.id)
+            let url = try await viewModel.playbackURL(for: item.id)
             if adoptForPlayback {
                 await loadMetadataChapters(from: url)
             }

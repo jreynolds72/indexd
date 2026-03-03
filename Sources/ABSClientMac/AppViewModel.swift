@@ -3,6 +3,17 @@ import ABSCore
 
 @MainActor
 final class AppViewModel: ObservableObject {
+    private enum DownloadFeatureError: LocalizedError {
+        case unavailable
+
+        var errorDescription: String? {
+            switch self {
+            case .unavailable:
+                return "Download storage unavailable on this device"
+            }
+        }
+    }
+
     @Published var serverScheme: String = "http"
     @Published var serverHost: String = ""
     @Published var serverPortText: String = "13378"
@@ -25,6 +36,8 @@ final class AppViewModel: ObservableObject {
     private var itemsByLibrary: [String: [ABSCore.LibraryItem]] = [:]
     private var coverDataByItemID: [String: Data] = [:]
     private var apiClient: ABSAPIClient?
+    private let downloadManager: DownloadManager?
+    private let directDownloadTransport: DownloadTransport
     private let secureStore: SecureStoring
     private var syncEngine: SyncEngine?
     private var syncOperationCount = 0
@@ -39,6 +52,8 @@ final class AppViewModel: ObservableObject {
         #else
         secureStore = KeychainSecureStore()
         #endif
+        downloadManager = try? DownloadManager()
+        directDownloadTransport = URLSessionDownloadTransport()
     }
 
     func bootstrap() async {
@@ -161,6 +176,95 @@ final class AppViewModel: ObservableObject {
             throw APIError.invalidResponse
         }
         return try await apiClient.playbackChapters(itemID: itemID)
+    }
+
+    func localDownloadURL(for itemID: String) async -> URL? {
+        guard let downloadManager else { return nil }
+        return await downloadManager.localFileURL(for: itemID)
+    }
+
+    func downloadState(for itemID: String) async -> DownloadState {
+        guard let downloadManager else { return .notDownloaded }
+        return await downloadManager.state(for: itemID)
+    }
+
+    func downloadedItemIDs() async -> Set<String> {
+        guard let downloadManager else { return [] }
+        return Set(await downloadManager.allDownloads().map(\.itemID))
+    }
+
+    @discardableResult
+    func downloadItem(
+        itemID: String,
+        progress: (@Sendable (Double) async -> Void)? = nil
+    ) async throws -> URL {
+        guard let downloadManager else {
+            throw DownloadFeatureError.unavailable
+        }
+        let remoteURL = try await streamURL(for: itemID)
+        let preferredFileName = item(withID: itemID)?.title
+        return try await downloadManager.download(
+            itemID: itemID,
+            from: remoteURL,
+            preferredFileName: preferredFileName,
+            progress: progress
+        )
+    }
+
+    func removeDownloadedItem(itemID: String) async throws {
+        guard let downloadManager else { return }
+        try await downloadManager.deleteDownload(itemID: itemID)
+    }
+
+    func clearAllDownloads() async throws {
+        guard let downloadManager else { return }
+        let records = await downloadManager.allDownloads()
+        for record in records {
+            try await downloadManager.deleteDownload(itemID: record.itemID)
+        }
+    }
+
+    func downloadCacheDirectoryURL() async -> URL? {
+        guard let downloadManager else { return nil }
+        let records = await downloadManager.allDownloads()
+        if let first = records.first {
+            return await downloadManager.localFileURL(for: first.itemID)?.deletingLastPathComponent()
+        }
+        // Triggered path by asking a state lookup and then inferring via app support.
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        return support?.appendingPathComponent("indexd/Downloads", isDirectory: true)
+    }
+
+    @discardableResult
+    func downloadItemToDirectory(
+        itemID: String,
+        directoryURL: URL,
+        progress: (@Sendable (Double) async -> Void)? = nil
+    ) async throws -> URL {
+        let remoteURL = try await streamURL(for: itemID)
+        let tempURL = try await directDownloadTransport.download(from: remoteURL, progress: progress)
+        let destinationURL = uniqueDestinationURL(
+            in: directoryURL,
+            itemID: itemID,
+            remoteURL: remoteURL
+        )
+
+        do {
+            try FileManager.default.moveItem(at: tempURL, to: destinationURL)
+        } catch {
+            try? FileManager.default.removeItem(at: destinationURL)
+            try FileManager.default.copyItem(at: tempURL, to: destinationURL)
+            try? FileManager.default.removeItem(at: tempURL)
+        }
+
+        return destinationURL
+    }
+
+    func playbackURL(for itemID: String) async throws -> URL {
+        if let localURL = await localDownloadURL(for: itemID) {
+            return localURL
+        }
+        return try await streamURL(for: itemID)
     }
 
     func coverData(for itemID: String) async -> Data? {
@@ -364,6 +468,28 @@ final class AppViewModel: ObservableObject {
         let items = try await apiClient.items(in: libraryID)
         itemsByLibrary[libraryID] = items
         displayedItems = items
+    }
+
+    private func uniqueDestinationURL(in directory: URL, itemID: String, remoteURL: URL) -> URL {
+        let ext = remoteURL.pathExtension.isEmpty ? "m4b" : remoteURL.pathExtension
+        let fallbackName = "book-\(itemID)"
+        let title = item(withID: itemID)?.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseName = sanitizedFileName((title?.isEmpty == false ? title! : fallbackName))
+
+        var candidate = directory.appendingPathComponent("\(baseName).\(ext)")
+        var attempt = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = directory.appendingPathComponent("\(baseName) \(attempt).\(ext)")
+            attempt += 1
+        }
+        return candidate
+    }
+
+    private func sanitizedFileName(_ value: String) -> String {
+        let invalid = CharacterSet(charactersIn: "/:\\?%*|\"<>")
+        let components = value.components(separatedBy: invalid)
+        let joined = components.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? "download" : joined
     }
 
     private func mergeDetailedItem(_ detailed: ABSCore.LibraryItem) {

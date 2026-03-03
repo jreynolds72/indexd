@@ -372,7 +372,8 @@ public actor ABSAPIClient {
 
         let data = try await authenticatedGET(url: detailsURL)
         guard let details = try? decoder.decode(ItemDetailDTO.self, from: data),
-              let audioFileID = details.media?.audioFiles?.first?.ino else {
+              let audioFile = details.media?.audioFiles?.first,
+              let audioFileID = audioFile.ino ?? audioFile.id else {
             return nil
         }
 

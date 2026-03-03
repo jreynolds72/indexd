@@ -73,10 +73,14 @@ private actor MockDownloadTransport: DownloadTransport {
         self.payload = payload
     }
 
-    func download(from remoteURL: URL) async throws -> URL {
+    func download(
+        from remoteURL: URL,
+        progress: (@Sendable (Double) async -> Void)?
+    ) async throws -> URL {
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("mock-download-\(UUID().uuidString)")
         try payload.write(to: tempURL)
+        await progress?(1.0)
         return tempURL
     }
 }

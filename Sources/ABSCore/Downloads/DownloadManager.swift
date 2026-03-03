@@ -16,13 +16,31 @@ public struct DownloadRecord: Codable, Equatable, Sendable {
     }
 }
 
-public enum DownloadError: Error {
+public enum DownloadError: Error, LocalizedError {
     case invalidStorageDirectory
     case fileMoveFailed
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidStorageDirectory:
+            return "Unable to access local download storage."
+        case .fileMoveFailed:
+            return "Downloaded file could not be moved into local storage."
+        }
+    }
 }
 
 public protocol DownloadTransport: Sendable {
-    func download(from remoteURL: URL) async throws -> URL
+    func download(
+        from remoteURL: URL,
+        progress: (@Sendable (Double) async -> Void)?
+    ) async throws -> URL
+}
+
+public extension DownloadTransport {
+    func download(from remoteURL: URL) async throws -> URL {
+        try await download(from: remoteURL, progress: nil)
+    }
 }
 
 public struct URLSessionDownloadTransport: DownloadTransport, @unchecked Sendable {
@@ -32,9 +50,146 @@ public struct URLSessionDownloadTransport: DownloadTransport, @unchecked Sendabl
         self.session = session
     }
 
-    public func download(from remoteURL: URL) async throws -> URL {
-        let (tempFileURL, _) = try await session.download(from: remoteURL)
-        return tempFileURL
+    public func download(
+        from remoteURL: URL,
+        progress: (@Sendable (Double) async -> Void)?
+    ) async throws -> URL {
+        guard progress != nil else {
+            let (tempFileURL, _) = try await session.download(from: remoteURL)
+            return tempFileURL
+        }
+
+        await progress?(0)
+        let delegate = DownloadDelegate(progress: progress)
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        defer {
+            session.finishTasksAndInvalidate()
+        }
+
+        return try await delegate.startDownload(remoteURL: remoteURL, session: session)
+    }
+}
+
+private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private let progress: (@Sendable (Double) async -> Void)?
+    private var continuation: CheckedContinuation<URL, Error>?
+    private var tempFileURL: URL?
+    private let lock = NSLock()
+
+    init(progress: (@Sendable (Double) async -> Void)?) {
+        self.progress = progress
+    }
+
+    func startDownload(remoteURL: URL, session: URLSession) async throws -> URL {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            self.continuation = continuation
+            lock.unlock()
+
+            let task = session.downloadTask(with: remoteURL)
+            task.resume()
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        let expectedBytes = resolvedExpectedBytes(
+            explicit: totalBytesExpectedToWrite,
+            task: downloadTask
+        )
+        guard expectedBytes > 0 else { return }
+        let fraction = min(1, max(0, Double(totalBytesWritten) / Double(expectedBytes)))
+        Task {
+            await progress?(fraction)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        // The URL provided here is transient and may be removed immediately after callback returns.
+        // Copy it to our own temporary location now so didCompleteWithError can safely consume it.
+        let retainedURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("indexd-download-retained-\(UUID().uuidString)")
+        do {
+            try? FileManager.default.removeItem(at: retainedURL)
+            try FileManager.default.copyItem(at: location, to: retainedURL)
+        } catch {
+            lock.lock()
+            tempFileURL = nil
+            lock.unlock()
+            return
+        }
+
+        lock.lock()
+        tempFileURL = retainedURL
+        lock.unlock()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        let continuation = self.continuation
+        let tempFileURL = self.tempFileURL
+        self.continuation = nil
+        self.tempFileURL = nil
+        lock.unlock()
+
+        if let error {
+            continuation?.resume(throwing: error)
+            return
+        }
+
+        guard let tempFileURL else {
+            continuation?.resume(throwing: DownloadError.fileMoveFailed)
+            return
+        }
+
+        Task {
+            await progress?(1.0)
+        }
+        continuation?.resume(returning: tempFileURL)
+    }
+
+    private func resolvedExpectedBytes(explicit: Int64, task: URLSessionDownloadTask) -> Int64 {
+        if explicit > 0 {
+            return explicit
+        }
+        if task.countOfBytesExpectedToReceive > 0 {
+            return task.countOfBytesExpectedToReceive
+        }
+        guard let response = task.response as? HTTPURLResponse else {
+            return -1
+        }
+
+        if let value = response.value(forHTTPHeaderField: "Content-Length"),
+           let length = Int64(value),
+           length > 0 {
+            return length
+        }
+
+        if let contentRange = response.value(forHTTPHeaderField: "Content-Range"),
+           let total = totalBytes(fromContentRange: contentRange),
+           total > 0 {
+            return total
+        }
+
+        return response.expectedContentLength
+    }
+
+    private func totalBytes(fromContentRange headerValue: String) -> Int64? {
+        // Example: bytes 0-1023/2048
+        guard let slashIndex = headerValue.lastIndex(of: "/") else { return nil }
+        let suffix = headerValue[headerValue.index(after: slashIndex)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard suffix != "*" else { return nil }
+        return Int64(suffix)
     }
 }
 
@@ -77,17 +232,27 @@ public actor DownloadManager {
         self.states = loaded.states
     }
 
-    public func download(itemID: String, from remoteURL: URL) async throws -> URL {
+    public func download(
+        itemID: String,
+        from remoteURL: URL,
+        preferredFileName: String? = nil,
+        progress: (@Sendable (Double) async -> Void)? = nil
+    ) async throws -> URL {
         if let existing = localFileURL(for: itemID) {
             states[itemID] = .downloaded
+            await progress?(1.0)
             return existing
         }
 
         states[itemID] = .downloading
 
         do {
-            let tempFileURL = try await transport.download(from: remoteURL)
-            let destinationURL = destinationURL(for: itemID, remoteURL: remoteURL)
+            let tempFileURL = try await transport.download(from: remoteURL, progress: progress)
+            let destinationURL = destinationURL(
+                for: itemID,
+                remoteURL: remoteURL,
+                preferredFileName: preferredFileName
+            )
 
             if fileManager.fileExists(atPath: destinationURL.path) {
                 try fileManager.removeItem(at: destinationURL)
@@ -153,10 +318,28 @@ public actor DownloadManager {
         try persistManifest()
     }
 
-    private func destinationURL(for itemID: String, remoteURL: URL) -> URL {
-        let ext = remoteURL.pathExtension
-        let fileName = ext.isEmpty ? itemID : "\(itemID).\(ext)"
-        return downloadsDirectory.appendingPathComponent(fileName)
+    private func destinationURL(for itemID: String, remoteURL: URL, preferredFileName: String?) -> URL {
+        let ext = remoteURL.pathExtension.isEmpty ? "m4b" : remoteURL.pathExtension
+        let baseName = sanitizedFileName(
+            (preferredFileName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? preferredFileName!
+            : itemID
+        )
+
+        var candidate = downloadsDirectory.appendingPathComponent("\(baseName).\(ext)")
+        var attempt = 2
+        while fileManager.fileExists(atPath: candidate.path) {
+            candidate = downloadsDirectory.appendingPathComponent("\(baseName) \(attempt).\(ext)")
+            attempt += 1
+        }
+        return candidate
+    }
+
+    private func sanitizedFileName(_ value: String) -> String {
+        let invalid = CharacterSet(charactersIn: "/:\\?%*|\"<>")
+        let components = value.components(separatedBy: invalid)
+        let joined = components.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? "download" : joined
     }
 
     private static func loadManifestFromDisk(

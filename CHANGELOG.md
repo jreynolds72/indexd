@@ -6,6 +6,31 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.1.0-beta.3] - 2026-03-03
+
+### Added
+- Offline download workflow for audiobooks:
+  - Download to app cache from item details, context menus, and bulk multi-select actions.
+  - Download to user-selected folder via Finder picker.
+  - Downloaded browse section and quick navigation into downloaded items.
+  - Download removal actions for single and multi-select.
+- Download status surfaces across the app:
+  - Toolbar download icon with circular progress ring.
+  - Download popout with per-item status, active linear progress bars, queue state, and click-through to item details.
+  - Download cache shortcut in Finder from toolbar/item menus.
+- Multi-select item operations in the books list and bulk actions from header menu/context menu.
+- Cover-art thumbnails in book rows in the main item list.
+
+### Changed
+- Download filenames now use user-friendly book-title based naming in app cache.
+- Download popout switched from paged results to continuous scrolling to avoid premature page splitting.
+- Download popout can be resized by drag handle and supports larger content areas.
+- Download toolbar icon rendering updated for improved visibility and clockwise progress from top.
+
+### Fixed
+- Download failures on some Audiobookshelf servers by falling back to `audioFile.id` when `audioFile.ino` is missing.
+- Download test transport updated for progress callback compatibility with the production transport protocol.
+
 ## [0.1.0-beta.2] - 2026-03-03
 
 ### Added
