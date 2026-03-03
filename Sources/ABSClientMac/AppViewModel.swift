@@ -3,7 +3,9 @@ import ABSCore
 
 @MainActor
 final class AppViewModel: ObservableObject {
-    @Published var serverURLText: String = ""
+    @Published var serverScheme: String = "http"
+    @Published var serverHost: String = ""
+    @Published var serverPortText: String = "13378"
     @Published var username: String = ""
     @Published var password: String = ""
     @Published var isConnecting = false
@@ -18,6 +20,7 @@ final class AppViewModel: ObservableObject {
 
     private let defaults = UserDefaults.standard
     private let serverDefaultsKey = "abs.server.url"
+    private let defaultABSPort = 13378
 
     private var itemsByLibrary: [String: [ABSCore.LibraryItem]] = [:]
     private var coverDataByItemID: [String: Data] = [:]
@@ -40,7 +43,7 @@ final class AppViewModel: ObservableObject {
 
     func bootstrap() async {
         if let savedServer = defaults.string(forKey: serverDefaultsKey), !savedServer.isEmpty {
-            serverURLText = savedServer
+            applyServerAddress(savedServer)
             await initializeClientFromSavedServer()
         }
     }
@@ -48,8 +51,8 @@ final class AppViewModel: ObservableObject {
     func connect() async {
         errorMessage = nil
 
-        guard let url = normalizedServerURL(from: serverURLText) else {
-            errorMessage = "Enter a valid server URL"
+        guard let url = composedServerURL() else {
+            errorMessage = "Enter a valid server host and port"
             return
         }
 
@@ -214,8 +217,8 @@ final class AppViewModel: ObservableObject {
     }
 
     var serverAddressDisplay: String {
-        let trimmed = serverURLText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "Not configured" : trimmed
+        guard let url = composedServerURL() else { return "Not configured" }
+        return url.absoluteString
     }
 
     var currentLibraryItems: [ABSCore.LibraryItem] {
@@ -424,7 +427,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func initializeClientFromSavedServer() async {
-        guard let url = normalizedServerURL(from: serverURLText) else { return }
+        guard let url = composedServerURL() else { return }
 
         do {
             let client = try await ABSAPIClient(baseURL: url, secureStore: secureStore)
@@ -467,17 +470,92 @@ final class AppViewModel: ObservableObject {
         isProgressSyncing = syncOperationCount > 0
     }
 
-    private func normalizedServerURL(from text: String) -> URL? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
+    private func composedServerURL() -> URL? {
+        let trimmedHost = serverHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedHost.isEmpty {
             return nil
         }
 
-        if let url = URL(string: trimmed), url.scheme != nil {
-            return url
+        let trimmedPort = serverPortText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let port: Int
+        if trimmedPort.isEmpty {
+            port = defaultABSPort
+        } else {
+            guard let parsedPort = Int(trimmedPort), (1...65535).contains(parsedPort) else {
+                return nil
+            }
+            port = parsedPort
         }
 
-        return URL(string: "https://\(trimmed)")
+        var host = trimmedHost
+        var scheme = serverScheme
+        if host.contains("://"), let parsed = URLComponents(string: host) {
+            if let parsedScheme = parsed.scheme?.lowercased(), parsedScheme == "http" || parsedScheme == "https" {
+                scheme = parsedScheme
+            }
+            if let parsedHost = parsed.host, !parsedHost.isEmpty {
+                host = parsedHost
+            }
+        }
+
+        if host.contains(":") && !host.contains("]") && !host.contains("[") {
+            let segments = host.split(separator: ":", omittingEmptySubsequences: false)
+            if segments.count == 2, let inlinePort = Int(segments[1]), (1...65535).contains(inlinePort) {
+                host = String(segments[0])
+                if trimmedPort.isEmpty {
+                    return buildURL(scheme: scheme, host: host, port: inlinePort)
+                }
+            }
+        }
+
+        return buildURL(scheme: scheme, host: host, port: port)
+    }
+
+    private func buildURL(scheme: String, host: String, port: Int) -> URL? {
+        let normalizedScheme = (scheme.lowercased() == "https") ? "https" : "http"
+        var components = URLComponents()
+        components.scheme = normalizedScheme
+        components.host = host
+        components.port = port
+        components.path = "/"
+        return components.url
+    }
+
+    private func applyServerAddress(_ raw: String) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        if let parsed = URLComponents(string: trimmed), parsed.host != nil {
+            let parsedScheme = parsed.scheme?.lowercased() ?? "http"
+            serverScheme = (parsedScheme == "https") ? "https" : "http"
+            serverHost = parsed.host ?? ""
+            if let parsedPort = parsed.port {
+                serverPortText = String(parsedPort)
+            } else {
+                serverPortText = String(defaultABSPort)
+            }
+            return
+        }
+
+        var candidate = trimmed
+        if !candidate.contains("://") {
+            candidate = "http://\(candidate)"
+        }
+
+        guard let parsed = URLComponents(string: candidate), parsed.host != nil else {
+            serverHost = trimmed
+            serverPortText = String(defaultABSPort)
+            return
+        }
+
+        let parsedScheme = parsed.scheme?.lowercased() ?? "http"
+        serverScheme = (parsedScheme == "https") ? "https" : "http"
+        serverHost = parsed.host ?? trimmed
+        if let parsedPort = parsed.port {
+            serverPortText = String(parsedPort)
+        } else {
+            serverPortText = String(defaultABSPort)
+        }
     }
 
     private func describe(_ error: Error) -> String {

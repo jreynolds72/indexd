@@ -1,9 +1,11 @@
 import SwiftUI
 import AVFoundation
 import AppKit
+import OSLog
 import ABSCore
 
 struct ContentView: View {
+    private static let settingsLogger = Logger(subsystem: "com.indexd.app", category: "settings")
     private enum ProgressHistorySource: String, Codable {
         case appClient = "App Client"
         case appPauseSync = "App Pause Sync"
@@ -202,6 +204,7 @@ struct ContentView: View {
     ]
 
     @EnvironmentObject private var preferences: AppPreferences
+    @Environment(\.openWindow) private var openWindow
     @StateObject private var viewModel = AppViewModel()
     @State private var selectedItemID: ABSCore.LibraryItem.ID?
     @State private var selectedGroupID: String?
@@ -1536,14 +1539,35 @@ struct ContentView: View {
                 .font(.title3)
                 .bold()
 
-            TextField("Server URL", text: $viewModel.serverURLText)
-                .textFieldStyle(.roundedBorder)
+            HStack(spacing: 8) {
+                Picker("Protocol", selection: $viewModel.serverScheme) {
+                    Text("http").tag("http")
+                    Text("https").tag("https")
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 92)
+
+                TextField("IP or Hostname", text: $viewModel.serverHost)
+                    .textFieldStyle(.roundedBorder)
+                    .submitLabel(.next)
+
+                TextField("Port", text: $viewModel.serverPortText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 92)
+                    .submitLabel(.next)
+            }
 
             TextField("Username", text: $viewModel.username)
                 .textFieldStyle(.roundedBorder)
+                .submitLabel(.next)
 
             SecureField("Password", text: $viewModel.password)
                 .textFieldStyle(.roundedBorder)
+                .submitLabel(.go)
+                .onSubmit {
+                    attemptServerConnect()
+                }
 
             if let error = viewModel.errorMessage, !error.isEmpty {
                 Text(error)
@@ -1561,29 +1585,16 @@ struct ContentView: View {
                 Spacer()
 
                 Button(viewModel.isConnecting ? "Connecting..." : "Connect") {
-                    Task {
-                        await viewModel.connect()
-                        if viewModel.isAuthenticated {
-                            showingServerSheet = false
-                            if let selectedLibraryID = viewModel.selectedLibraryID, browseTabByLibraryID[selectedLibraryID] == nil {
-                                browseTabByLibraryID[selectedLibraryID] = .books
-                            }
-                            if currentBrowseTab == .books {
-                                selectedItemID = browsedItems.first?.id
-                                selectedGroupID = nil
-                            } else {
-                                selectedGroupID = displayedBrowseGroups.first?.id
-                                selectedItemID = nil
-                            }
-                            updateNowPlaying()
-                        }
-                    }
+                    attemptServerConnect()
                 }
                 .disabled(viewModel.isConnecting)
             }
         }
+        .onSubmit {
+            attemptServerConnect()
+        }
         .padding(20)
-        .frame(minWidth: 420)
+        .frame(minWidth: 520)
     }
 
     private var selectedItem: ABSCore.LibraryItem? {
@@ -2499,16 +2510,31 @@ struct ContentView: View {
 
     private func openSettingsWindow(tab: SettingsTab) {
         preferences.selectedSettingsTab = tab
-
-        let showSettings = Selector(("showSettingsWindow:"))
-        let showPreferences = Selector(("showPreferencesWindow:"))
-
-        let opened = NSApp.sendAction(showSettings, to: nil, from: nil)
-        if !opened {
-            _ = NSApp.sendAction(showPreferences, to: nil, from: nil)
-        }
-
+        Self.settingsLogger.info("Opening settings window for tab: \(tab.rawValue, privacy: .public)")
+        openWindow(id: "indexd-settings-window")
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func attemptServerConnect() {
+        guard !viewModel.isConnecting else { return }
+
+        Task {
+            await viewModel.connect()
+            if viewModel.isAuthenticated {
+                showingServerSheet = false
+                if let selectedLibraryID = viewModel.selectedLibraryID, browseTabByLibraryID[selectedLibraryID] == nil {
+                    browseTabByLibraryID[selectedLibraryID] = .books
+                }
+                if currentBrowseTab == .books {
+                    selectedItemID = browsedItems.first?.id
+                    selectedGroupID = nil
+                } else {
+                    selectedGroupID = displayedBrowseGroups.first?.id
+                    selectedItemID = nil
+                }
+                updateNowPlaying()
+            }
+        }
     }
 
     private func play() {

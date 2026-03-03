@@ -49,5 +49,12 @@ struct IndexdApp: App {
         }
         .defaultSize(width: 1200, height: 560)
         .windowResizability(.automatic)
+
+        Window("Settings", id: "indexd-settings-window") {
+            PreferencesView()
+                .environmentObject(preferences)
+        }
+        .defaultSize(width: 1200, height: 560)
+        .windowResizability(.automatic)
     }
 }
