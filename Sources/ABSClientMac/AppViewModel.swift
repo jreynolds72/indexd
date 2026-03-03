@@ -408,6 +408,12 @@ final class AppViewModel: ObservableObject {
 
         let incomingSeries = incoming.seriesName?.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasIncomingSeries = (incomingSeries?.isEmpty == false)
+        let incomingBlurb = incoming.blurb?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasIncomingBlurb = (incomingBlurb?.isEmpty == false)
+        let incomingPublisher = incoming.publisher?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasIncomingPublisher = (incomingPublisher?.isEmpty == false)
+        let incomingLanguage = incoming.language?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasIncomingLanguage = (incomingLanguage?.isEmpty == false)
 
         return ABSCore.LibraryItem(
             id: existing.id,
@@ -420,6 +426,10 @@ final class AppViewModel: ObservableObject {
             collections: incoming.collections.isEmpty ? existing.collections : incoming.collections,
             genres: incoming.genres.isEmpty ? existing.genres : incoming.genres,
             tags: incoming.tags.isEmpty ? existing.tags : incoming.tags,
+            blurb: hasIncomingBlurb ? incomingBlurb : existing.blurb,
+            publisher: hasIncomingPublisher ? incomingPublisher : existing.publisher,
+            publishedYear: incoming.publishedYear ?? existing.publishedYear,
+            language: hasIncomingLanguage ? incomingLanguage : existing.language,
             libraryID: incoming.libraryID.isEmpty ? existing.libraryID : incoming.libraryID,
             duration: (incoming.duration ?? 0) > 0 ? incoming.duration : existing.duration,
             chapters: incoming.chapters.isEmpty ? existing.chapters : incoming.chapters

@@ -555,6 +555,10 @@ private struct LibraryItemDTO: Decodable {
             let collections: [String]
             let genres: [String]
             let tags: [String]
+            let blurb: String?
+            let publisher: String?
+            let publishedYear: Int?
+            let language: String?
 
             enum CodingKeys: String, CodingKey {
                 case title
@@ -569,6 +573,14 @@ private struct LibraryItemDTO: Decodable {
                 case collections
                 case genres
                 case tags
+                case description
+                case summary
+                case subtitle
+                case publisher
+                case publishedYear
+                case publishYear
+                case year
+                case language
             }
 
             init(from decoder: Decoder) throws {
@@ -606,6 +618,22 @@ private struct LibraryItemDTO: Decodable {
                     ((try? c.decodeIfPresent([String].self, forKey: .tags)) ?? nil ?? [])
                     + (((try? c.decodeIfPresent([NameValue].self, forKey: .tags)) ?? nil ?? []).compactMap(\.name))
                 )
+
+                blurb = LibraryItemDTO.firstNonEmptyString([
+                    (try? c.decodeIfPresent(String.self, forKey: .description)) ?? nil,
+                    (try? c.decodeIfPresent(String.self, forKey: .summary)) ?? nil,
+                    (try? c.decodeIfPresent(String.self, forKey: .subtitle)) ?? nil
+                ])
+                publisher = LibraryItemDTO.firstNonEmptyString([
+                    (try? c.decodeIfPresent(String.self, forKey: .publisher)) ?? nil
+                ])
+                publishedYear = LibraryItemDTO.decodeFlexibleInt(
+                    from: c,
+                    keys: [.publishedYear, .publishYear, .year]
+                )
+                language = LibraryItemDTO.firstNonEmptyString([
+                    (try? c.decodeIfPresent(String.self, forKey: .language)) ?? nil
+                ])
             }
         }
 
@@ -624,6 +652,10 @@ private struct LibraryItemDTO: Decodable {
     let collections: [String]
     let genres: [String]
     let tags: [String]
+    let blurb: String?
+    let publisher: String?
+    let publishedYear: Int?
+    let language: String?
     let duration: TimeInterval?
     let chapters: [ChapterDTO]?
 
@@ -639,6 +671,14 @@ private struct LibraryItemDTO: Decodable {
         case collections
         case genres
         case tags
+        case description
+        case summary
+        case subtitle
+        case publisher
+        case publishedYear
+        case publishYear
+        case year
+        case language
         case duration
         case chapters
         case media
@@ -690,6 +730,21 @@ private struct LibraryItemDTO: Decodable {
             ((try? c.decodeIfPresent([String].self, forKey: .tags)) ?? nil ?? [])
             + (metadata?.tags ?? [])
         )
+        blurb = Self.firstNonEmptyString([
+            (try? c.decodeIfPresent(String.self, forKey: .description)) ?? nil,
+            (try? c.decodeIfPresent(String.self, forKey: .summary)) ?? nil,
+            (try? c.decodeIfPresent(String.self, forKey: .subtitle)) ?? nil,
+            metadata?.blurb
+        ])
+        publisher = Self.firstNonEmptyString([
+            (try? c.decodeIfPresent(String.self, forKey: .publisher)) ?? nil,
+            metadata?.publisher
+        ])
+        publishedYear = Self.decodeFlexibleInt(from: c, keys: [.publishedYear, .publishYear, .year]) ?? metadata?.publishedYear
+        language = Self.firstNonEmptyString([
+            (try? c.decodeIfPresent(String.self, forKey: .language)) ?? nil,
+            metadata?.language
+        ])
         duration = ((try? c.decodeIfPresent(TimeInterval.self, forKey: .duration)) ?? nil)
             ?? media?.duration
         chapters = ((try? c.decodeIfPresent([ChapterDTO].self, forKey: .chapters)) ?? nil)
@@ -712,10 +767,20 @@ private struct LibraryItemDTO: Decodable {
             collections: collections,
             genres: genres,
             tags: tags,
+            blurb: blurb,
+            publisher: publisher,
+            publishedYear: publishedYear,
+            language: language,
             libraryID: libraryID,
             duration: duration,
             chapters: mappedChapters
         )
+    }
+
+    private static func firstNonEmptyString(_ values: [String?]) -> String? {
+        values
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty })
     }
 
     private static func cleanStringArray(_ values: [String]) -> [String] {

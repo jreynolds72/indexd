@@ -1023,13 +1023,47 @@ struct ContentView: View {
                                 .lineLimit(3)
                                 .minimumScaleFactor(0.75)
                                 .multilineTextAlignment(.center)
-                            if let author = item.author {
-                                Text(author)
-                                    .font(.title3)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                                    .minimumScaleFactor(0.85)
-                                    .multilineTextAlignment(.center)
+                            let authors = displayAuthorNames(for: item)
+                            if !authors.isEmpty {
+                                VStack(spacing: 2) {
+                                    ForEach(Array(authors.enumerated()), id: \.offset) { _, author in
+                                        Button(author) {
+                                            navigateToBrowseGroup(tab: .authors, groupID: author.trimmedForGrouping)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .font(.title3)
+                                        .foregroundStyle(Color.blue)
+                                        .lineLimit(2)
+                                        .minimumScaleFactor(0.85)
+                                        .multilineTextAlignment(.center)
+                                        .help("Browse author")
+                                    }
+                                }
+                            }
+                            if let narrator = preferredNarrator(for: item) {
+                                Button("Narrated by \(narrator)") {
+                                    navigateToBrowseGroup(tab: .narrators, groupID: narrator.trimmedForGrouping)
+                                }
+                                .buttonStyle(.plain)
+                                .font(.subheadline)
+                                .foregroundStyle(Color.blue)
+                                .lineLimit(2)
+                                .minimumScaleFactor(0.85)
+                                .multilineTextAlignment(.center)
+                                .help("Browse narrator")
+                            }
+                            let series = inferredSeriesName(for: item)
+                            if series != "Unknown Series" {
+                                Button(seriesDisplayLabel(for: item)) {
+                                    navigateToBrowseGroup(tab: .series, groupID: series)
+                                }
+                                .buttonStyle(.plain)
+                                .font(.subheadline)
+                                .foregroundStyle(Color.blue)
+                                .lineLimit(2)
+                                .minimumScaleFactor(0.85)
+                                .multilineTextAlignment(.center)
+                                .help("Browse series")
                             }
 
                             Text(positionSummary(for: item))
@@ -1050,8 +1084,44 @@ struct ContentView: View {
                         Divider()
 
                         VStack(alignment: .leading, spacing: 12) {
+                            if let blurb = renderedBlurb(for: item) {
+                                Text(blurb)
+                                    .font(.body)
+                                    .foregroundStyle(.primary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                                Divider()
+                            }
+
                             detailRow(title: "Duration", value: formattedDuration(item.duration))
-                            detailRow(title: "Chapters", value: "\(item.chapters.count)")
+                            if let author = authorDisplayValue(for: item) {
+                                detailRow(title: "Author", value: author)
+                            }
+                            if let narrator = preferredNarrator(for: item) {
+                                detailRow(title: "Narrator", value: narrator)
+                            }
+                            if let series = seriesValue(for: item) {
+                                detailRow(title: "Series", value: series)
+                            }
+                            if let publisher = item.publisher, !publisher.isEmpty {
+                                detailRow(title: "Publisher", value: publisher)
+                            }
+                            if let publishedYear = item.publishedYear {
+                                detailRow(title: "Published", value: "\(publishedYear)")
+                            }
+                            if let language = item.language, !language.isEmpty {
+                                detailRow(title: "Language", value: language)
+                            }
+                            if !item.genres.isEmpty {
+                                detailRow(title: "Genres", value: item.genres.joined(separator: ", "), multiline: true)
+                            }
+                            if !item.tags.isEmpty {
+                                detailRow(title: "Tags", value: item.tags.joined(separator: ", "), multiline: true)
+                            }
+                            if !item.collections.isEmpty {
+                                detailRow(title: "Collections", value: item.collections.joined(separator: ", "), multiline: true)
+                            }
+                            detailRow(title: "Chapters", value: "\(visibleChapterCount(for: item))")
                             detailRow(title: "Library", value: selectedLibraryName)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1829,6 +1899,19 @@ struct ContentView: View {
         browseTabByLibraryID[currentLibraryID] = browseTab
     }
 
+    private func navigateToBrowseGroup(tab: LibraryBrowseTab, groupID: String) {
+        guard viewModel.selectedLibraryID != nil else { return }
+
+        selectCurrentLibraryBrowseTab(tab)
+        selectedItemID = nil
+        let groups = displayedBrowseGroups
+        if groups.contains(where: { $0.id == groupID }) {
+            selectedGroupID = groupID
+        } else {
+            selectedGroupID = groups.first?.id
+        }
+    }
+
     private var filteredBaseItems: [ABSCore.LibraryItem] {
         let items = viewModel.displayedItems
         switch itemFilter {
@@ -2375,15 +2458,107 @@ struct ContentView: View {
     }
 
     private func detailRow(title: String, value: String) -> some View {
-        HStack {
+        detailRow(title: title, value: value, multiline: false)
+    }
+
+    private func detailRow(title: String, value: String, multiline: Bool) -> some View {
+        HStack(alignment: multiline ? .top : .center) {
             Text(title)
                 .foregroundStyle(.secondary)
-            Spacer()
+                .frame(width: 90, alignment: .leading)
+            Spacer(minLength: 8)
             Text(value)
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
+                .lineLimit(multiline ? nil : 1)
+                .minimumScaleFactor(multiline ? 1 : 0.7)
+                .multilineTextAlignment(.trailing)
+                .fixedSize(horizontal: false, vertical: multiline)
         }
         .font(.body)
+    }
+
+    private func displayAuthorNames(for item: ABSCore.LibraryItem) -> [String] {
+        let names = authorNames(for: item)
+        if !names.isEmpty {
+            return names
+        }
+        if let author = item.author?.trimmingCharacters(in: .whitespacesAndNewlines), !author.isEmpty {
+            return [author]
+        }
+        return []
+    }
+
+    private func authorDisplayValue(for item: ABSCore.LibraryItem) -> String? {
+        let names = displayAuthorNames(for: item)
+        guard !names.isEmpty else { return nil }
+        return names.joined(separator: ", ")
+    }
+
+    private func seriesValue(for item: ABSCore.LibraryItem) -> String? {
+        let series = inferredSeriesName(for: item)
+        guard series != "Unknown Series" else { return nil }
+        if let sequence = seriesSequenceDisplayValue(for: item) {
+            return "\(series) #\(sequence)"
+        }
+        return series
+    }
+
+    private func seriesDisplayLabel(for item: ABSCore.LibraryItem) -> String {
+        seriesValue(for: item) ?? inferredSeriesName(for: item)
+    }
+
+    private func renderedBlurb(for item: ABSCore.LibraryItem) -> AttributedString? {
+        guard let raw = item.blurb?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+
+        if raw.contains("<"), raw.contains(">"), let parsed = htmlAttributedString(raw) {
+            return parsed
+        }
+
+        let stripped = strippedHTML(raw)
+        guard !stripped.isEmpty else { return nil }
+        return AttributedString(stripped)
+    }
+
+    private func htmlAttributedString(_ html: String) -> AttributedString? {
+        guard let data = html.data(using: .utf8) else { return nil }
+
+        do {
+            let nsAttributed = try NSAttributedString(
+                data: data,
+                options: [
+                    .documentType: NSAttributedString.DocumentType.html,
+                    .characterEncoding: String.Encoding.utf8.rawValue
+                ],
+                documentAttributes: nil
+            )
+            let plain = nsAttributed.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !plain.isEmpty else { return nil }
+            return AttributedString(nsAttributed)
+        } catch {
+            return nil
+        }
+    }
+
+    private func strippedHTML(_ input: String) -> String {
+        let noTags = input.replacingOccurrences(
+            of: "<[^>]+>",
+            with: "",
+            options: .regularExpression
+        )
+        return noTags
+            .replacingOccurrences(of: "\u{00A0}", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func visibleChapterCount(for item: ABSCore.LibraryItem) -> Int {
+        if playbackDisplayItem?.id == item.id {
+            let activeCount = currentChapters.count
+            if activeCount > 0 {
+                return activeCount
+            }
+        }
+        return item.chapters.count
     }
 
     private func detailHorizontalPadding(for width: CGFloat) -> CGFloat {

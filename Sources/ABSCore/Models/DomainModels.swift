@@ -35,6 +35,10 @@ public struct LibraryItem: Codable, Equatable, Identifiable, Sendable {
     public let collections: [String]
     public let genres: [String]
     public let tags: [String]
+    public let blurb: String?
+    public let publisher: String?
+    public let publishedYear: Int?
+    public let language: String?
     public let libraryID: String
     public let duration: TimeInterval?
     public let chapters: [Chapter]
@@ -50,6 +54,10 @@ public struct LibraryItem: Codable, Equatable, Identifiable, Sendable {
         collections: [String] = [],
         genres: [String] = [],
         tags: [String] = [],
+        blurb: String? = nil,
+        publisher: String? = nil,
+        publishedYear: Int? = nil,
+        language: String? = nil,
         libraryID: String,
         duration: TimeInterval?,
         chapters: [Chapter]
@@ -64,6 +72,10 @@ public struct LibraryItem: Codable, Equatable, Identifiable, Sendable {
         self.collections = collections
         self.genres = genres
         self.tags = tags
+        self.blurb = blurb
+        self.publisher = publisher
+        self.publishedYear = publishedYear
+        self.language = language
         self.libraryID = libraryID
         self.duration = duration
         self.chapters = chapters
