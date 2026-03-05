@@ -59,11 +59,20 @@ actor OpenLibraryMetadataMatcher {
             }
         }
 
-        let mapped = mergedDocuments.compactMap { doc in
+        let openLibraryCandidates = mergedDocuments.compactMap { doc in
             candidate(from: doc, localItem: item, localTitle: queryTitle, localAuthors: localAuthors)
         }
 
-        return mapped
+        let googleVolumes = try await googleBooksSearch(
+            queryTitle: queryTitle,
+            firstAuthor: localAuthors.first,
+            limit: max(1, min(limit * 2, 20))
+        )
+        let googleCandidates = googleVolumes.compactMap { volume in
+            googleCandidate(from: volume, localItem: item, localTitle: queryTitle, localAuthors: localAuthors)
+        }
+
+        return (openLibraryCandidates + googleCandidates)
             .sorted { lhs, rhs in
                 if lhs.confidence == rhs.confidence {
                     return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
@@ -72,6 +81,35 @@ actor OpenLibraryMetadataMatcher {
             }
             .prefix(limit)
             .map { $0 }
+    }
+
+    private func googleBooksSearch(
+        queryTitle: String,
+        firstAuthor: String?,
+        limit: Int
+    ) async throws -> [GoogleBooksResponse.Volume] {
+        var queryParts: [String] = []
+        queryParts.append("intitle:\(queryTitle)")
+        if let firstAuthor, !firstAuthor.isEmpty {
+            queryParts.append("inauthor:\(firstAuthor)")
+        }
+
+        var components = URLComponents(string: "https://www.googleapis.com/books/v1/volumes")
+        components?.queryItems = [
+            URLQueryItem(name: "q", value: queryParts.joined(separator: "+")),
+            URLQueryItem(name: "maxResults", value: String(max(1, min(limit, 40))))
+        ]
+        guard let url = components?.url else {
+            return []
+        }
+
+        let (data, response) = try await session.data(from: url)
+        guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+            return []
+        }
+
+        let decoded = try JSONDecoder().decode(GoogleBooksResponse.self, from: data)
+        return decoded.items ?? []
     }
 
     private func search(queryItems: [URLQueryItem]) async throws -> [OpenLibrarySearchResponse.Document] {
@@ -142,6 +180,66 @@ actor OpenLibraryMetadataMatcher {
             blurb: document.firstSentence?.trimmingCharacters(in: .whitespacesAndNewlines),
             publisher: (publisher?.isEmpty == false) ? publisher : nil,
             publishedYear: document.firstPublishYear,
+            language: (language?.isEmpty == false) ? language : nil
+        )
+    }
+
+    private func googleCandidate(
+        from volume: GoogleBooksResponse.Volume,
+        localItem: ABSCore.LibraryItem,
+        localTitle: String,
+        localAuthors: [String]
+    ) -> MetadataMatchCandidate? {
+        let info = volume.volumeInfo
+        let candidateTitle = normalizedCandidateTitle(info.title ?? "")
+        guard !candidateTitle.isEmpty else { return nil }
+
+        let candidateAuthors = (info.authors ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let titleScore = titleSimilarity(localTitle, candidateTitle)
+        let authorScore: Double
+        if localAuthors.isEmpty {
+            authorScore = candidateAuthors.isEmpty ? 0.5 : 0.65
+        } else if candidateAuthors.isEmpty {
+            authorScore = 0
+        } else {
+            authorScore = localAuthors.map { local in
+                candidateAuthors.map { candidate in titleSimilarity(local, candidate) }.max() ?? 0
+            }.reduce(0, +) / Double(max(1, localAuthors.count))
+        }
+
+        let yearScore = publicationYearScore(localItem.publishedYear, publishedYear(from: info.publishedDate))
+        let subtitle = info.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sequenceScore = sequenceAlignmentScore(
+            localItem.seriesSequence,
+            sequenceFromText(subtitle ?? candidateTitle)
+        )
+        let confidence = max(0, min(1, (titleScore * 0.62) + (authorScore * 0.25) + (yearScore * 0.08) + (sequenceScore * 0.05)))
+        guard confidence >= 0.52 else { return nil }
+
+        let categories = normalizedUnique(info.categories ?? [], limit: 10)
+        let language = normalizedLanguage(info.language)
+        let seriesFromSubtitle = seriesInfo(from: subtitle ?? "", fallback: nil).name
+
+        return MetadataMatchCandidate(
+            id: UUID().uuidString,
+            source: "GoogleBooks",
+            sourceID: volume.id,
+            confidence: confidence,
+            confidenceReason: "title \(percent(titleScore)), author \(percent(authorScore)), year \(percent(yearScore)), sequence \(percent(sequenceScore))",
+            title: candidateTitle,
+            authors: candidateAuthors,
+            narrator: nil,
+            seriesName: seriesFromSubtitle,
+            seriesSequence: sequenceFromText(subtitle ?? candidateTitle),
+            collections: [],
+            genres: categories,
+            tags: categories,
+            blurb: info.description?.trimmingCharacters(in: .whitespacesAndNewlines),
+            publisher: info.publisher?.trimmingCharacters(in: .whitespacesAndNewlines),
+            publishedYear: publishedYear(from: info.publishedDate),
             language: (language?.isEmpty == false) ? language : nil
         )
     }
@@ -305,6 +403,14 @@ actor OpenLibraryMetadataMatcher {
         return map[code] ?? raw
     }
 
+    private func publishedYear(from publishedDate: String?) -> Int? {
+        guard let publishedDate else { return nil }
+        let trimmed = publishedDate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 4 else { return nil }
+        let prefix = String(trimmed.prefix(4))
+        return Int(prefix)
+    }
+
     private func candidateKey(for doc: OpenLibrarySearchResponse.Document) -> String {
         if let key = doc.key?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
             return key
@@ -400,4 +506,24 @@ private struct OpenLibrarySearchResponse: Decodable {
     }
 
     let docs: [Document]
+}
+
+private struct GoogleBooksResponse: Decodable {
+    struct Volume: Decodable {
+        let id: String?
+        let volumeInfo: VolumeInfo
+    }
+
+    struct VolumeInfo: Decodable {
+        let title: String?
+        let subtitle: String?
+        let authors: [String]?
+        let publishedDate: String?
+        let language: String?
+        let publisher: String?
+        let description: String?
+        let categories: [String]?
+    }
+
+    let items: [Volume]?
 }
