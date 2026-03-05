@@ -388,6 +388,11 @@ struct ContentView: View {
     )
     @State private var metadataEditorBusy = false
     @State private var metadataEditorErrorMessage: String?
+    @State private var showingManualMetadataMatch = false
+    @State private var manualMetadataMatchQuery = ""
+    @State private var manualMetadataMatchCandidates: [MetadataMatchCandidate] = []
+    @State private var manualMetadataMatchSelectedCandidateID: String?
+    @State private var manualMetadataMatchBusy = false
     @State private var isTimelineScrubbing = false
     @State private var scrubPreviewSeconds: TimeInterval?
     @State private var progressHydrationTask: Task<Void, Never>?
@@ -607,6 +612,10 @@ struct ContentView: View {
 
         view = AnyView(view.sheet(isPresented: $showingMetadataEditor) {
             metadataEditorSheet
+        })
+
+        view = AnyView(view.sheet(isPresented: $showingManualMetadataMatch) {
+            manualMetadataMatchSheet
         })
 
         view = AnyView(view.task {
@@ -3045,8 +3054,17 @@ struct ContentView: View {
             .navigationTitle("Metadata Editor")
             .toolbar {
                 ToolbarItemGroup(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        showingMetadataEditor = false
+                    }
+
                     Button("Quick Match") {
                         Task { await quickMatchFromMetadataEditor() }
+                    }
+                    .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil)
+
+                    Button("Match…") {
+                        openManualMetadataMatch()
                     }
                     .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil)
 
@@ -3090,10 +3108,114 @@ struct ContentView: View {
         .frame(minWidth: 760, minHeight: 560)
     }
 
+    private var selectedManualMetadataMatchCandidate: MetadataMatchCandidate? {
+        guard let manualMetadataMatchSelectedCandidateID else { return nil }
+        return manualMetadataMatchCandidates.first(where: { $0.id == manualMetadataMatchSelectedCandidateID })
+    }
+
+    private var manualMetadataMatchSheet: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 12) {
+                manualMetadataMatchSearchRow
+                manualMetadataMatchStatusRow
+                manualMetadataMatchCandidateList
+            }
+            .padding(12)
+            .navigationTitle("Match Metadata")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        showingManualMetadataMatch = false
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Apply Match") {
+                        Task { await applyManualMetadataMatch() }
+                    }
+                    .disabled(manualMetadataMatchBusy || selectedManualMetadataMatchCandidate == nil)
+                }
+            }
+        }
+        .frame(minWidth: 720, minHeight: 480)
+    }
+
+    private var manualMetadataMatchSearchRow: some View {
+        HStack(spacing: 8) {
+            TextField("Search title", text: $manualMetadataMatchQuery)
+                .textFieldStyle(.roundedBorder)
+            Button("Search") {
+                Task { await runManualMetadataSearch() }
+            }
+            .disabled(manualMetadataMatchBusy || manualMetadataMatchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
+    @ViewBuilder
+    private var manualMetadataMatchStatusRow: some View {
+        if manualMetadataMatchBusy {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Searching…")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var manualMetadataMatchCandidateList: some View {
+        if manualMetadataMatchCandidates.isEmpty, !manualMetadataMatchBusy {
+            Text("No candidates yet. Enter a search term and run Search.")
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        } else {
+            List(manualMetadataMatchCandidates) { candidate in
+                manualMetadataMatchCandidateRow(candidate)
+            }
+        }
+    }
+
+    private func manualMetadataMatchCandidateRow(_ candidate: MetadataMatchCandidate) -> some View {
+        Button {
+            manualMetadataMatchSelectedCandidateID = candidate.id
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(candidate.title)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                    if !candidate.authors.isEmpty {
+                        Text(candidate.authors.joined(separator: ", "))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(candidate.confidenceReason)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("\(Int((candidate.confidence * 100).rounded()))%")
+                    .font(.subheadline.monospacedDigit())
+                    .foregroundStyle(candidate.confidence >= 0.75 ? .green : .orange)
+                if manualMetadataMatchSelectedCandidateID == candidate.id {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
     private func openMetadataEditor(for itemID: String) {
         guard let item = viewModel.item(withID: itemID) else { return }
         metadataEditorItemID = itemID
-        metadataEditorDraft = MetadataEditorDraft(
+        metadataEditorDraft = metadataEditorDraft(from: item)
+        metadataEditorErrorMessage = nil
+        showingMetadataEditor = true
+    }
+
+    private func metadataEditorDraft(from item: ABSCore.LibraryItem) -> MetadataEditorDraft {
+        MetadataEditorDraft(
             title: item.title,
             authorsText: displayAuthorNames(for: item).joined(separator: ", "),
             narrator: preferredNarrator(for: item) ?? "",
@@ -3105,8 +3227,6 @@ struct ContentView: View {
             language: item.language ?? "",
             publishedYearText: item.publishedYear.map(String.init) ?? ""
         )
-        metadataEditorErrorMessage = nil
-        showingMetadataEditor = true
     }
 
     private func parseListField(_ raw: String) -> [String] {
@@ -3130,6 +3250,59 @@ struct ContentView: View {
         guard metadataEditorItemID == nil else { return }
         guard let fallbackItemID = resolvedMetadataEditorItemID() else { return }
         openMetadataEditor(for: fallbackItemID)
+    }
+
+    private func openManualMetadataMatch() {
+        guard let itemID = resolvedMetadataEditorItemID(),
+              let item = viewModel.item(withID: itemID) else { return }
+        manualMetadataMatchQuery = metadataEditorDraft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? item.title
+            : metadataEditorDraft.title
+        manualMetadataMatchCandidates = []
+        manualMetadataMatchSelectedCandidateID = nil
+        showingManualMetadataMatch = true
+        Task { await runManualMetadataSearch() }
+    }
+
+    private func runManualMetadataSearch() async {
+        guard let itemID = resolvedMetadataEditorItemID() else { return }
+        let query = manualMetadataMatchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+
+        manualMetadataMatchBusy = true
+        defer { manualMetadataMatchBusy = false }
+
+        do {
+            let candidates = try await viewModel.metadataMatchCandidatesForLocalItem(itemID: itemID, query: query, limit: 10)
+            manualMetadataMatchCandidates = candidates
+            manualMetadataMatchSelectedCandidateID = candidates.first?.id
+            if candidates.isEmpty {
+                metadataEditorErrorMessage = "No metadata match candidates found."
+            }
+        } catch {
+            metadataEditorErrorMessage = "Metadata search failed: \(viewModel.describeError(error))"
+        }
+    }
+
+    private func applyManualMetadataMatch() async {
+        guard let itemID = resolvedMetadataEditorItemID(),
+              let candidate = selectedManualMetadataMatchCandidate else { return }
+        manualMetadataMatchBusy = true
+        defer { manualMetadataMatchBusy = false }
+
+        do {
+            let didApply = try await viewModel.applyLocalMetadataCandidate(itemID: itemID, candidate: candidate)
+            guard didApply else {
+                metadataEditorErrorMessage = "Selected match did not change metadata."
+                return
+            }
+            if let refreshed = viewModel.item(withID: itemID) {
+                metadataEditorDraft = metadataEditorDraft(from: refreshed)
+            }
+            showingManualMetadataMatch = false
+        } catch {
+            metadataEditorErrorMessage = "Applying metadata match failed: \(viewModel.describeError(error))"
+        }
     }
 
     private func saveMetadataEditor() async {
@@ -3174,18 +3347,7 @@ struct ContentView: View {
             }
             if let refreshed = viewModel.item(withID: itemID) {
                 await MainActor.run {
-                    metadataEditorDraft = MetadataEditorDraft(
-                        title: refreshed.title,
-                        authorsText: displayAuthorNames(for: refreshed).joined(separator: ", "),
-                        narrator: preferredNarrator(for: refreshed) ?? "",
-                        seriesName: refreshed.seriesName ?? "",
-                        blurb: refreshed.blurb ?? "",
-                        genresText: refreshed.genres.joined(separator: ", "),
-                        tagsText: refreshed.tags.joined(separator: ", "),
-                        publisher: refreshed.publisher ?? "",
-                        language: refreshed.language ?? "",
-                        publishedYearText: refreshed.publishedYear.map(String.init) ?? ""
-                    )
+                    metadataEditorDraft = metadataEditorDraft(from: refreshed)
                 }
             }
         } catch {

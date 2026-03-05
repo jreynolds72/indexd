@@ -538,10 +538,46 @@ final class AppViewModel: ObservableObject {
 
     @discardableResult
     func quickMatchLocalItemMetadata(itemID: String) async throws -> Bool {
+        let candidates = try await metadataMatchCandidatesForLocalItem(itemID: itemID, query: nil, limit: 1)
+        guard let candidate = candidates.first else { return false }
+        return try await applyLocalMetadataCandidate(itemID: itemID, candidate: candidate)
+    }
+
+    func metadataMatchCandidatesForLocalItem(
+        itemID: String,
+        query: String?,
+        limit: Int = 8
+    ) async throws -> [MetadataMatchCandidate] {
+        guard let item = item(withID: itemID) else { return [] }
+        let trimmedQuery = query?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let localQueryTitle = (trimmedQuery?.isEmpty == false) ? trimmedQuery! : item.title
+
+        let synthetic = ABSCore.LibraryItem(
+            id: item.id,
+            title: localQueryTitle,
+            author: item.author,
+            authors: item.authors,
+            narrator: item.narrator,
+            seriesName: item.seriesName,
+            seriesSequence: item.seriesSequence,
+            collections: item.collections,
+            genres: item.genres,
+            tags: item.tags,
+            blurb: item.blurb,
+            publisher: item.publisher,
+            publishedYear: item.publishedYear,
+            language: item.language,
+            libraryID: item.libraryID,
+            duration: item.duration,
+            chapters: item.chapters
+        )
+        return try await metadataMatcher.match(for: synthetic, limit: limit)
+    }
+
+    @discardableResult
+    func applyLocalMetadataCandidate(itemID: String, candidate: MetadataMatchCandidate) async throws -> Bool {
         guard let item = item(withID: itemID) else { return false }
         guard let rootID = rootID(forLocalLibraryID: item.libraryID) else { return false }
-        let candidates = try await metadataMatcher.match(for: item, limit: 1)
-        guard let candidate = candidates.first else { return false }
         let changed = try await localLibraryManager.applyMetadataCandidate(
             rootID: rootID,
             itemID: itemID,
