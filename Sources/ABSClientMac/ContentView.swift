@@ -1059,8 +1059,8 @@ struct ContentView: View {
                 }
 
                 if currentBrowseTab == .downloaded {
-                    Button("Open Cache") {
-                        Task { await openDownloadCacheInFinder() }
+                    Button(openLibraryFolderActionTitle) {
+                        Task { await openPreferredLibraryFolderInFinder() }
                     }
 
                     Button(isClearingDownloads ? "Clearing…" : "Clear Downloads", role: .destructive) {
@@ -1248,7 +1248,7 @@ struct ContentView: View {
 
                     Divider()
 
-                    Menu("Download…") {
+                    Menu(downloadMenuTitle) {
                         Button(downloadBusyItemIDs.contains(item.id) ? "Downloading to App Cache…" : "Download to App Cache") {
                             Task { await downloadItem(item.id) }
                         }
@@ -1259,8 +1259,8 @@ struct ContentView: View {
                         }
                         .disabled(downloadBusyItemIDs.contains(item.id))
 
-                        Button("Open Download Cache in Finder") {
-                            Task { await openDownloadCacheInFinder() }
+                        Button(openLibraryFolderActionTitle) {
+                            Task { await openPreferredLibraryFolderInFinder() }
                         }
 
                         if downloadState(for: item.id) == .downloaded {
@@ -3536,8 +3536,8 @@ struct ContentView: View {
             Divider()
 
             HStack {
-                Button("Open Download Cache in Finder") {
-                    Task { await openDownloadCacheInFinder() }
+                Button(openLibraryFolderActionTitle) {
+                    Task { await openPreferredLibraryFolderInFinder() }
                 }
 
                 Spacer()
@@ -3619,9 +3619,9 @@ struct ContentView: View {
             }
             .disabled(downloadBusyItemIDs.contains(item.id))
 
-            Button("Open Download Cache in Finder") {
+            Button(openLibraryFolderActionTitle) {
                 showingItemDownloadPopover = false
-                Task { await openDownloadCacheInFinder() }
+                Task { await openPreferredLibraryFolderInFinder() }
             }
 
             if downloadState(for: item.id) == .downloaded {
@@ -3644,6 +3644,14 @@ struct ContentView: View {
         let clamped = min(max(mean, 0), 1)
         // Treat near-zero as indeterminate so UI still conveys "busy".
         return clamped > 0.001 ? clamped : nil
+    }
+
+    private var downloadMenuTitle: String {
+        viewModel.isSelectedLibraryLocal ? "Local Library…" : "Download…"
+    }
+
+    private var openLibraryFolderActionTitle: String {
+        viewModel.isSelectedLibraryLocal ? "Open Local Library in Finder" : "Open Download Cache in Finder"
     }
 
     private var downloadToolbarLabel: some View {
@@ -4603,6 +4611,18 @@ struct ContentView: View {
 
         try? FileManager.default.createDirectory(at: cacheURL, withIntermediateDirectories: true)
         NSWorkspace.shared.open(cacheURL)
+    }
+
+    private func openPreferredLibraryFolderInFinder() async {
+        if viewModel.isSelectedLibraryLocal {
+            guard let localRootURL = viewModel.selectedLocalLibraryRootURL() else {
+                viewModel.setError("Local library folder unavailable")
+                return
+            }
+            NSWorkspace.shared.open(localRootURL)
+            return
+        }
+        await openDownloadCacheInFinder()
     }
 
     private func downloadItemToChosenLocation(item: ABSCore.LibraryItem) async {
