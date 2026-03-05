@@ -812,7 +812,7 @@ final class AppViewModel: ObservableObject {
         }
 
         let author = resolvedAuthor(for: item)
-        let series = item?.seriesName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let series = normalizedSeriesFolderName(item?.seriesName)
         let bookTitle = item?.title.trimmingCharacters(in: .whitespacesAndNewlines)
 
         var resolvedSegments: [String] = []
@@ -872,6 +872,22 @@ final class AppViewModel: ObservableObject {
             return author
         }
         return nil
+    }
+
+    private func normalizedSeriesFolderName(_ rawSeries: String?) -> String? {
+        guard let rawSeries else { return nil }
+        let trimmed = rawSeries.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // ABS may append sequence markers to series labels (e.g. "Series Name #1").
+        let pattern = #"\s*#\d+\s*$"#
+        let normalized = trimmed.replacingOccurrences(
+            of: pattern,
+            with: "",
+            options: .regularExpression
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return normalized.isEmpty ? nil : normalized
     }
 
     private func sanitizedFileName(_ value: String) -> String {
