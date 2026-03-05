@@ -8,6 +8,19 @@ final class AppViewModel: ObservableObject {
         let template: String
     }
 
+    struct LocalMetadataEdit: Sendable {
+        let title: String
+        let authors: [String]
+        let narrator: String?
+        let seriesName: String?
+        let blurb: String?
+        let genres: [String]
+        let tags: [String]
+        let publisher: String?
+        let language: String?
+        let publishedYear: Int?
+    }
+
     private enum DownloadFeatureError: LocalizedError {
         case unavailable
 
@@ -63,6 +76,7 @@ final class AppViewModel: ObservableObject {
     private let directDownloadTransport: DownloadTransport
     private let secureStore: SecureStoring
     private let localLibraryManager = LocalLibraryManager()
+    private let metadataMatcher = OpenLibraryMetadataMatcher()
     private lazy var localLibraryWatcher = LocalLibraryWatcher { [weak self] in
         guard let self else { return }
         Task { @MainActor in
@@ -515,6 +529,64 @@ final class AppViewModel: ObservableObject {
 
     func localLibraryRootName(rootID: String) -> String? {
         localLibraryRoots.first(where: { $0.id == rootID })?.name
+    }
+
+    func canEditMetadata(itemID: String) -> Bool {
+        guard let item = item(withID: itemID) else { return false }
+        return item.libraryID.hasPrefix(LocalLibraryManager.libraryIDPrefix)
+    }
+
+    @discardableResult
+    func quickMatchLocalItemMetadata(itemID: String) async throws -> Bool {
+        guard let item = item(withID: itemID) else { return false }
+        guard let rootID = rootID(forLocalLibraryID: item.libraryID) else { return false }
+        let candidates = try await metadataMatcher.match(for: item, limit: 1)
+        guard let candidate = candidates.first else { return false }
+        let changed = try await localLibraryManager.applyMetadataCandidate(
+            rootID: rootID,
+            itemID: itemID,
+            candidate: candidate
+        )
+        if changed {
+            await refreshLocalLibraries()
+        }
+        return changed
+    }
+
+    @discardableResult
+    func updateLocalItemMetadata(itemID: String, edit: LocalMetadataEdit) async throws -> Bool {
+        guard let existing = item(withID: itemID) else { return false }
+        guard let rootID = rootID(forLocalLibraryID: existing.libraryID) else { return false }
+
+        let updated = ABSCore.LibraryItem(
+            id: existing.id,
+            title: edit.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? existing.title : edit.title.trimmingCharacters(in: .whitespacesAndNewlines),
+            author: edit.authors.first ?? existing.author,
+            authors: edit.authors,
+            narrator: normalizedOptional(edit.narrator),
+            seriesName: normalizedOptional(edit.seriesName),
+            seriesSequence: existing.seriesSequence,
+            collections: existing.collections,
+            genres: edit.genres,
+            tags: edit.tags,
+            blurb: normalizedOptional(edit.blurb),
+            publisher: normalizedOptional(edit.publisher),
+            publishedYear: edit.publishedYear,
+            language: normalizedOptional(edit.language),
+            libraryID: existing.libraryID,
+            duration: existing.duration,
+            chapters: existing.chapters
+        )
+
+        let changed = try await localLibraryManager.updateItemMetadata(
+            rootID: rootID,
+            itemID: itemID,
+            updatedItem: updated
+        )
+        if changed {
+            await refreshLocalLibraries()
+        }
+        return changed
     }
 
     func addLocalLibraryRoot(directoryURL: URL) async throws {
@@ -1052,6 +1124,17 @@ final class AppViewModel: ObservableObject {
     private func isLocalLibrary(id: String?) -> Bool {
         guard let id else { return false }
         return id.hasPrefix(LocalLibraryManager.libraryIDPrefix)
+    }
+
+    private func rootID(forLocalLibraryID libraryID: String) -> String? {
+        guard libraryID.hasPrefix(LocalLibraryManager.libraryIDPrefix) else { return nil }
+        return String(libraryID.dropFirst(LocalLibraryManager.libraryIDPrefix.count))
+    }
+
+    private func normalizedOptional(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func locallyFilteredItems(baseItems: [ABSCore.LibraryItem], query: String) -> [ABSCore.LibraryItem] {

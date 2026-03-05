@@ -280,6 +280,19 @@ struct ContentView: View {
         }
     }
 
+    private struct MetadataEditorDraft {
+        var title: String
+        var authorsText: String
+        var narrator: String
+        var seriesName: String
+        var blurb: String
+        var genresText: String
+        var tagsText: String
+        var publisher: String
+        var language: String
+        var publishedYearText: String
+    }
+
     private let mediaIntegration = MacMediaIntegrationManager.shared
     private let progressDefaultsKey = "abs.local.progress.v1"
     private let progressHistoryDefaultsKey = "abs.local.progress.history.v1"
@@ -359,6 +372,22 @@ struct ContentView: View {
     @State private var downloadPopoverDragStartHeight: CGFloat?
     @State private var showingItemDownloadPopover = false
     @State private var showingBulkActionsPopover = false
+    @State private var showingMetadataEditor = false
+    @State private var metadataEditorItemID: String?
+    @State private var metadataEditorDraft = MetadataEditorDraft(
+        title: "",
+        authorsText: "",
+        narrator: "",
+        seriesName: "",
+        blurb: "",
+        genresText: "",
+        tagsText: "",
+        publisher: "",
+        language: "",
+        publishedYearText: ""
+    )
+    @State private var metadataEditorBusy = false
+    @State private var metadataEditorErrorMessage: String?
     @State private var isTimelineScrubbing = false
     @State private var scrubPreviewSeconds: TimeInterval?
     @State private var progressHydrationTask: Task<Void, Never>?
@@ -574,6 +603,10 @@ struct ContentView: View {
 
         view = AnyView(view.sheet(isPresented: $showingServerSheet) {
             serverSheet
+        })
+
+        view = AnyView(view.sheet(isPresented: $showingMetadataEditor) {
+            metadataEditorSheet
         })
 
         view = AnyView(view.task {
@@ -1210,6 +1243,13 @@ struct ContentView: View {
                         Task { await setPlayedState(for: contextItemIDs, isPlayed: false) }
                     }
                 } else {
+                    Button("Edit Metadata…") {
+                        openMetadataEditor(for: item.id)
+                    }
+                    .disabled(!viewModel.canEditMetadata(itemID: item.id))
+
+                    Divider()
+
                     Button("Start from Beginning") {
                         selectedItemID = item.id
                         selectedItemIDs = [item.id]
@@ -2906,6 +2946,15 @@ struct ContentView: View {
             }
             .disabled(selectedVisibleItemIDs.isEmpty)
 
+            if selectedVisibleItemIDs.count == 1, let itemID = selectedVisibleItemIDs.first {
+                Divider()
+                Button("Edit Selected Metadata…") {
+                    showingBulkActionsPopover = false
+                    openMetadataEditor(for: itemID)
+                }
+                .disabled(!viewModel.canEditMetadata(itemID: itemID))
+            }
+
             Divider()
 
             Button("Download Selected to App Cache (\(selectedVisibleItemIDs.count))") {
@@ -2963,6 +3012,166 @@ struct ContentView: View {
         }
         .padding(12)
         .frame(width: 290, alignment: .leading)
+    }
+
+    private var metadataEditorItem: ABSCore.LibraryItem? {
+        guard let metadataEditorItemID else { return nil }
+        return viewModel.item(withID: metadataEditorItemID)
+    }
+
+    private var metadataEditorSheet: some View {
+        NavigationStack {
+            Form {
+                Section("Details") {
+                    TextField("Title", text: $metadataEditorDraft.title)
+                    TextField("Authors (comma-separated)", text: $metadataEditorDraft.authorsText)
+                    TextField("Narrators (comma-separated)", text: $metadataEditorDraft.narrator)
+                    TextField("Series", text: $metadataEditorDraft.seriesName)
+                    TextField("Publish Year", text: $metadataEditorDraft.publishedYearText)
+                    TextField("Publisher", text: $metadataEditorDraft.publisher)
+                    TextField("Language", text: $metadataEditorDraft.language)
+                }
+
+                Section("Description") {
+                    TextEditor(text: $metadataEditorDraft.blurb)
+                        .frame(minHeight: 100)
+                }
+
+                Section("Classification") {
+                    TextField("Genres (comma-separated)", text: $metadataEditorDraft.genresText)
+                    TextField("Tags (comma-separated)", text: $metadataEditorDraft.tagsText)
+                }
+            }
+            .navigationTitle("Metadata Editor")
+            .toolbar {
+                ToolbarItemGroup(placement: .cancellationAction) {
+                    Button("Quick Match") {
+                        Task { await quickMatchFromMetadataEditor() }
+                    }
+                    .disabled(metadataEditorBusy || metadataEditorItemID == nil)
+
+                    Button("Re-Scan") {
+                        if let itemID = metadataEditorItemID {
+                            openMetadataEditor(for: itemID)
+                        }
+                    }
+                    .disabled(metadataEditorBusy || metadataEditorItemID == nil)
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        Task { await saveMetadataEditor() }
+                    }
+                    .disabled(metadataEditorBusy || metadataEditorItemID == nil)
+                }
+            }
+            .overlay {
+                if metadataEditorBusy {
+                    ProgressView()
+                        .controlSize(.large)
+                }
+            }
+            .alert("Metadata Error", isPresented: Binding(
+                get: { metadataEditorErrorMessage != nil },
+                set: { newValue in
+                    if !newValue { metadataEditorErrorMessage = nil }
+                }
+            )) {
+                Button("OK", role: .cancel) {
+                    metadataEditorErrorMessage = nil
+                }
+            } message: {
+                Text(metadataEditorErrorMessage ?? "Unknown error")
+            }
+        }
+        .frame(minWidth: 760, minHeight: 560)
+    }
+
+    private func openMetadataEditor(for itemID: String) {
+        guard let item = viewModel.item(withID: itemID) else { return }
+        metadataEditorItemID = itemID
+        metadataEditorDraft = MetadataEditorDraft(
+            title: item.title,
+            authorsText: displayAuthorNames(for: item).joined(separator: ", "),
+            narrator: preferredNarrator(for: item) ?? "",
+            seriesName: item.seriesName ?? "",
+            blurb: item.blurb ?? "",
+            genresText: item.genres.joined(separator: ", "),
+            tagsText: item.tags.joined(separator: ", "),
+            publisher: item.publisher ?? "",
+            language: item.language ?? "",
+            publishedYearText: item.publishedYear.map(String.init) ?? ""
+        )
+        metadataEditorErrorMessage = nil
+        showingMetadataEditor = true
+    }
+
+    private func parseListField(_ raw: String) -> [String] {
+        raw
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func saveMetadataEditor() async {
+        guard let itemID = metadataEditorItemID else { return }
+        metadataEditorBusy = true
+        defer { metadataEditorBusy = false }
+
+        let parsedYear = Int(metadataEditorDraft.publishedYearText.trimmingCharacters(in: .whitespacesAndNewlines))
+        let edit = AppViewModel.LocalMetadataEdit(
+            title: metadataEditorDraft.title,
+            authors: parseListField(metadataEditorDraft.authorsText),
+            narrator: metadataEditorDraft.narrator,
+            seriesName: metadataEditorDraft.seriesName,
+            blurb: metadataEditorDraft.blurb,
+            genres: parseListField(metadataEditorDraft.genresText),
+            tags: parseListField(metadataEditorDraft.tagsText),
+            publisher: metadataEditorDraft.publisher,
+            language: metadataEditorDraft.language,
+            publishedYear: parsedYear
+        )
+
+        do {
+            _ = try await viewModel.updateLocalItemMetadata(itemID: itemID, edit: edit)
+            await MainActor.run {
+                showingMetadataEditor = false
+            }
+        } catch {
+            metadataEditorErrorMessage = "Failed saving metadata: \(viewModel.describeError(error))"
+        }
+    }
+
+    private func quickMatchFromMetadataEditor() async {
+        guard let itemID = metadataEditorItemID else { return }
+        metadataEditorBusy = true
+        defer { metadataEditorBusy = false }
+
+        do {
+            let didMatch = try await viewModel.quickMatchLocalItemMetadata(itemID: itemID)
+            if !didMatch {
+                metadataEditorErrorMessage = "No metadata match candidates found."
+                return
+            }
+            if let refreshed = viewModel.item(withID: itemID) {
+                await MainActor.run {
+                    metadataEditorDraft = MetadataEditorDraft(
+                        title: refreshed.title,
+                        authorsText: displayAuthorNames(for: refreshed).joined(separator: ", "),
+                        narrator: preferredNarrator(for: refreshed) ?? "",
+                        seriesName: refreshed.seriesName ?? "",
+                        blurb: refreshed.blurb ?? "",
+                        genresText: refreshed.genres.joined(separator: ", "),
+                        tagsText: refreshed.tags.joined(separator: ", "),
+                        publisher: refreshed.publisher ?? "",
+                        language: refreshed.language ?? "",
+                        publishedYearText: refreshed.publishedYear.map(String.init) ?? ""
+                    )
+                }
+            }
+        } catch {
+            metadataEditorErrorMessage = "Quick match failed: \(viewModel.describeError(error))"
+        }
     }
 
     private func inferredSeriesName(for item: ABSCore.LibraryItem) -> String {

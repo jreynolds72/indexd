@@ -223,6 +223,34 @@ actor LocalLibraryManager {
         return true
     }
 
+    @discardableResult
+    func updateItemMetadata(
+        rootID: String,
+        itemID: String,
+        updatedItem: ABSCore.LibraryItem
+    ) throws -> Bool {
+        guard var items = state.itemsByRootID[rootID] else {
+            return false
+        }
+        guard let itemIndex = items.firstIndex(where: { $0.item.id == itemID }) else {
+            return false
+        }
+
+        let existingRecord = items[itemIndex]
+        guard existingRecord.item != updatedItem else {
+            return false
+        }
+
+        items[itemIndex] = PersistedItem(
+            item: updatedItem,
+            primaryFilePath: existingRecord.primaryFilePath,
+            coverData: existingRecord.coverData
+        )
+        state.itemsByRootID[rootID] = items
+        try persist()
+        return true
+    }
+
     private func scanRoot(_ root: PersistedRoot) async throws -> [PersistedItem] {
         let rootURL = URL(fileURLWithPath: root.directoryPath, isDirectory: true)
         guard fileManager.fileExists(atPath: rootURL.path) else {
