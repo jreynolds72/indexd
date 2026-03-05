@@ -80,11 +80,6 @@ git push origin v0.1.0-beta.4
 gh release create v0.1.0-beta.4 dist/indexd-macos-v0.1.0-beta.4.zip --prerelease
 ```
 
-## Notarization (Planned)
-
-Unsigned/ad-hoc signed builds can show macOS Gatekeeper warnings ("unidentified developer").
-For distribution without that warning, use Developer ID signing and notarization before release.
-
 ## Contributing and Security
 
 - Contributing guide: [CONTRIBUTING.md](./CONTRIBUTING.md)
