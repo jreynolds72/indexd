@@ -3051,13 +3051,8 @@ struct ContentView: View {
                     TextField("Tags (comma-separated)", text: $metadataEditorDraft.tagsText)
                 }
             }
-            .navigationTitle("Metadata Editor")
-            .toolbar {
-                ToolbarItemGroup(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        showingMetadataEditor = false
-                    }
-
+            .safeAreaInset(edge: .bottom) {
+                HStack(spacing: 10) {
                     Button("Quick Match") {
                         Task { await quickMatchFromMetadataEditor() }
                     }
@@ -3074,15 +3069,24 @@ struct ContentView: View {
                         }
                     }
                     .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil)
-                }
 
-                ToolbarItem(placement: .confirmationAction) {
+                    Spacer()
+
+                    Button("Cancel") {
+                        showingMetadataEditor = false
+                    }
+
                     Button("Save") {
                         Task { await saveMetadataEditor() }
                     }
                     .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil)
+                    .buttonStyle(.borderedProminent)
                 }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(.regularMaterial)
             }
+            .navigationTitle("Metadata Editor")
             .overlay {
                 if metadataEditorBusy {
                     ProgressView()
