@@ -191,6 +191,29 @@ struct PreferencesView: View {
                 }
             }
 
+            Section("File Organization") {
+                Toggle("Enable Local Library File Organization", isOn: $preferences.localFileOrganizationEnabled)
+
+                Text("When enabled, copied files are placed using the template below. Items missing required template metadata are placed in `Unmatched`.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                TextField(
+                    "Template",
+                    text: $preferences.localFileOrganizationTemplate,
+                    prompt: Text(AppPreferences.defaultLocalFileOrganizationTemplate)
+                )
+                .textFieldStyle(.roundedBorder)
+                .disabled(!preferences.localFileOrganizationEnabled)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Supported variables: `<Author>`, `<Series>`, `<BookTitle>`")
+                    Text("Example: `<Author>/<Series>/<BookTitle>`")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
             Section("Roots") {
                 if localLibraryRoots.isEmpty, !localLibraryLoading {
                     Text("Add a local library from the main app to manage it here.")

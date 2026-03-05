@@ -3,6 +3,11 @@ import ABSCore
 
 @MainActor
 final class AppViewModel: ObservableObject {
+    struct LocalCopyOrganizationOptions: Sendable {
+        let enabled: Bool
+        let template: String
+    }
+
     private enum DownloadFeatureError: LocalizedError {
         case unavailable
 
@@ -383,6 +388,7 @@ final class AppViewModel: ObservableObject {
         directoryURL: URL,
         progress: (@Sendable (Double) async -> Void)? = nil
     ) async throws -> URL {
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         let remoteURL = try await streamURL(for: itemID)
         let tempURL = try await directDownloadTransport.download(from: remoteURL, progress: progress)
         let destinationURL = uniqueDestinationURL(
@@ -542,6 +548,7 @@ final class AppViewModel: ObservableObject {
     func copyItemToLocalLibrary(
         itemID: String,
         targetRootID: String,
+        organizationOptions: LocalCopyOrganizationOptions,
         progress: (@Sendable (Double) async -> Void)? = nil
     ) async throws -> URL {
         if let sourceItem = item(withID: itemID),
@@ -553,9 +560,16 @@ final class AppViewModel: ObservableObject {
             throw LocalCopyError.localRootUnavailable
         }
 
+        let sourceItem = item(withID: itemID)
+        let destinationDirectory = localCopyDestinationDirectory(
+            baseDirectory: targetRoot.directoryURL,
+            item: sourceItem,
+            options: organizationOptions
+        )
+
         return try await downloadItemToDirectory(
             itemID: itemID,
-            directoryURL: targetRoot.directoryURL,
+            directoryURL: destinationDirectory,
             progress: progress
         )
     }
@@ -780,6 +794,84 @@ final class AppViewModel: ObservableObject {
             attempt += 1
         }
         return candidate
+    }
+
+    private func localCopyDestinationDirectory(
+        baseDirectory: URL,
+        item: ABSCore.LibraryItem?,
+        options: LocalCopyOrganizationOptions
+    ) -> URL {
+        guard options.enabled else { return baseDirectory }
+
+        let templateSegments = options.template
+            .split(separator: "/")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !templateSegments.isEmpty else {
+            return baseDirectory.appendingPathComponent("Unmatched", isDirectory: true)
+        }
+
+        let author = resolvedAuthor(for: item)
+        let series = item?.seriesName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bookTitle = item?.title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var resolvedSegments: [String] = []
+        for rawSegment in templateSegments {
+            guard let replaced = replacedTemplateSegment(
+                rawSegment,
+                author: author,
+                series: series,
+                bookTitle: bookTitle
+            ) else {
+                return baseDirectory.appendingPathComponent("Unmatched", isDirectory: true)
+            }
+
+            let sanitized = sanitizedFileName(replaced)
+            if sanitized.isEmpty || sanitized == "download" {
+                return baseDirectory.appendingPathComponent("Unmatched", isDirectory: true)
+            }
+            resolvedSegments.append(sanitized)
+        }
+
+        var directory = baseDirectory
+        for segment in resolvedSegments {
+            directory.appendPathComponent(segment, isDirectory: true)
+        }
+        return directory
+    }
+
+    private func replacedTemplateSegment(
+        _ segment: String,
+        author: String?,
+        series: String?,
+        bookTitle: String?
+    ) -> String? {
+        var result = segment
+
+        if result.contains("<Author>") {
+            guard let author, !author.isEmpty else { return nil }
+            result = result.replacingOccurrences(of: "<Author>", with: author)
+        }
+        if result.contains("<Series>") {
+            guard let series, !series.isEmpty else { return nil }
+            result = result.replacingOccurrences(of: "<Series>", with: series)
+        }
+        if result.contains("<BookTitle>") {
+            guard let bookTitle, !bookTitle.isEmpty else { return nil }
+            result = result.replacingOccurrences(of: "<BookTitle>", with: bookTitle)
+        }
+
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func resolvedAuthor(for item: ABSCore.LibraryItem?) -> String? {
+        if let first = item?.authors.first?.trimmingCharacters(in: .whitespacesAndNewlines), !first.isEmpty {
+            return first
+        }
+        if let author = item?.author?.trimmingCharacters(in: .whitespacesAndNewlines), !author.isEmpty {
+            return author
+        }
+        return nil
     }
 
     private func sanitizedFileName(_ value: String) -> String {

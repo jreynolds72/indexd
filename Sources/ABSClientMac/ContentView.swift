@@ -4976,6 +4976,12 @@ struct ContentView: View {
             _ = try await viewModel.copyItemToLocalLibrary(
                 itemID: itemID,
                 targetRootID: targetRootID,
+                organizationOptions: AppViewModel.LocalCopyOrganizationOptions(
+                    enabled: preferences.localFileOrganizationEnabled,
+                    template: preferences.localFileOrganizationTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? AppPreferences.defaultLocalFileOrganizationTemplate
+                        : preferences.localFileOrganizationTemplate
+                ),
                 progress: { progress in
                     await MainActor.run {
                         downloadProgressByItemID[itemID] = progress
