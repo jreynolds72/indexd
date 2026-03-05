@@ -614,10 +614,6 @@ struct ContentView: View {
             metadataEditorSheet
         })
 
-        view = AnyView(view.sheet(isPresented: $showingManualMetadataMatch) {
-            manualMetadataMatchSheet
-        })
-
         view = AnyView(view.task {
             await viewModel.bootstrap()
             loadLocalPlaybackMetadata()
@@ -3107,6 +3103,9 @@ struct ContentView: View {
             }
             .onAppear {
                 hydrateMetadataEditorContextIfNeeded()
+            }
+            .sheet(isPresented: $showingManualMetadataMatch) {
+                manualMetadataMatchSheet
             }
         }
         .frame(minWidth: 760, minHeight: 560)
