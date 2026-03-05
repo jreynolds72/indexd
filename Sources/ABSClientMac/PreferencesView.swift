@@ -1,9 +1,20 @@
 import SwiftUI
+import AppKit
+import ABSCore
 
 struct PreferencesView: View {
     @EnvironmentObject private var preferences: AppPreferences
     @State private var captureTarget: CaptureTarget?
     @State private var keyCaptureMonitor: Any?
+    @State private var showUninstallSummarySheet = false
+    @State private var uninstallInProgress = false
+    @State private var uninstallErrorMessage: String?
+    @State private var showUninstallProgressSheet = false
+    @State private var cachedDownloads: [CachedDownloadSelection] = []
+    @State private var loadingCachedDownloads = false
+    @State private var uninstallStepStates: [UninstallStep: UninstallStepState] = Dictionary(
+        uniqueKeysWithValues: UninstallStep.allCases.map { ($0, .pending) }
+    )
 
     private struct CaptureTarget: Equatable {
         enum Slot {
@@ -13,6 +24,45 @@ struct PreferencesView: View {
 
         let action: ShortcutAction
         let slot: Slot
+    }
+
+    private enum UninstallStepState {
+        case pending
+        case inProgress
+        case complete
+        case failed
+    }
+
+    private struct CachedDownloadSelection: Identifiable {
+        let id: String
+        let title: String
+        let author: String
+        var selected: Bool
+    }
+
+    private enum UninstallCleanupAction: String, CaseIterable, Identifiable {
+        case clearSupportFolder
+        case clearKeychain
+        case clearLogs
+        case clearPreferences
+        case deleteAppBundle
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .clearSupportFolder:
+                return "Clear Application Support data"
+            case .clearKeychain:
+                return "Clear saved keychain credentials"
+            case .clearLogs:
+                return "Clear app logs and caches"
+            case .clearPreferences:
+                return "Clear app preferences"
+            case .deleteAppBundle:
+                return "Delete indexd.app bundle"
+            }
+        }
     }
 
     var body: some View {
@@ -27,6 +77,12 @@ struct PreferencesView: View {
                 .tag(SettingsTab.shortcuts)
                 .tabItem {
                     Label("Shortcuts", systemImage: "keyboard")
+                }
+
+            maintenanceTab
+                .tag(SettingsTab.maintenance)
+                .tabItem {
+                    Label("Maintenance", systemImage: "wrench.and.screwdriver")
                 }
         }
         .padding(20)
@@ -64,6 +120,177 @@ struct PreferencesView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private var maintenanceTab: some View {
+        Form {
+            Section {
+                Button(role: .destructive) {
+                    showUninstallSummarySheet = true
+                } label: {
+                    Text("Uninstall indexd…")
+                }
+                .disabled(uninstallInProgress)
+
+                if uninstallInProgress {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Preparing uninstall…")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } header: {
+                Text("Uninstall")
+            } footer: {
+                Text("This removes app data and the app bundle. Optionally, you can export downloaded books first.")
+            }
+        }
+        .formStyle(.grouped)
+        .alert("Uninstall Failed", isPresented: uninstallErrorBinding) {
+            Button("OK", role: .cancel) {
+                uninstallErrorMessage = nil
+            }
+        } message: {
+            Text(uninstallErrorMessage ?? "Unknown error")
+        }
+        .sheet(isPresented: $showUninstallSummarySheet) {
+            uninstallSummarySheet
+        }
+        .sheet(isPresented: $showUninstallProgressSheet) {
+            uninstallProgressSheet
+        }
+    }
+
+    private var uninstallSummarySheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Uninstall Summary")
+                .font(.title3.bold())
+
+            Text("indexd will perform the following cleanup actions:")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(UninstallCleanupAction.allCases) { action in
+                    Label(action.title, systemImage: "checklist")
+                        .labelStyle(.titleAndIcon)
+                }
+            }
+            .padding(12)
+            .background(.thinMaterial.opacity(0.2))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            Divider()
+
+            HStack {
+                Text("Cached Books")
+                    .font(.headline)
+                Spacer()
+                if loadingCachedDownloads {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Text("\(cachedDownloads.count)")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if cachedDownloads.isEmpty {
+                Text(loadingCachedDownloads ? "Loading cached books…" : "No cached books found.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 8)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach($cachedDownloads) { $book in
+                            Toggle(isOn: $book.selected) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(book.title)
+                                        .fontWeight(.semibold)
+                                    Text(book.author)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .toggleStyle(.checkbox)
+                            .padding(.vertical, 4)
+
+                            Divider()
+                        }
+                    }
+                }
+                .frame(maxHeight: 240)
+                .padding(10)
+                .background(.thinMaterial.opacity(0.2))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) {
+                    showUninstallSummarySheet = false
+                }
+
+                Button(uninstallPrimaryActionTitle, role: .destructive) {
+                    runUninstallFromSummary()
+                }
+                .disabled(uninstallInProgress || loadingCachedDownloads)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 640, minHeight: 560)
+        .task(id: showUninstallSummarySheet) {
+            guard showUninstallSummarySheet else { return }
+            await loadCachedDownloadsForSummary()
+        }
+    }
+
+    private var uninstallProgressSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Uninstalling indexd")
+                .font(.title3.bold())
+
+            Text("The app will close automatically after helper handoff.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(UninstallStep.allCases) { step in
+                    HStack(spacing: 10) {
+                        uninstallStatusIcon(for: step)
+                        Text(step.title)
+                    }
+                }
+            }
+
+            Spacer()
+        }
+        .padding(20)
+        .frame(minWidth: 500, minHeight: 320)
+    }
+
+    @ViewBuilder
+    private func uninstallStatusIcon(for step: UninstallStep) -> some View {
+        switch uninstallStepStates[step] ?? .pending {
+        case .pending:
+            Image(systemName: "circle")
+                .foregroundStyle(.secondary)
+        case .inProgress:
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 14, height: 14)
+        case .complete:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case .failed:
+            Image(systemName: "xmark.octagon.fill")
+                .foregroundStyle(.red)
+        }
     }
 
     private var shortcutsTab: some View {
@@ -292,5 +519,109 @@ struct PreferencesView: View {
             NSEvent.removeMonitor(keyCaptureMonitor)
             self.keyCaptureMonitor = nil
         }
+    }
+
+    private var uninstallErrorBinding: Binding<Bool> {
+        Binding(
+            get: { uninstallErrorMessage != nil },
+            set: { visible in
+                if !visible {
+                    uninstallErrorMessage = nil
+                }
+            }
+        )
+    }
+
+    private var selectedCachedDownloadIDs: Set<String> {
+        Set(cachedDownloads.filter(\.selected).map(\.id))
+    }
+
+    private var uninstallPrimaryActionTitle: String {
+        selectedCachedDownloadIDs.isEmpty ? "Uninstall" : "Choose Folder…"
+    }
+
+    private func runUninstallFromSummary() {
+        guard !uninstallInProgress else { return }
+        let selectedIDs = selectedCachedDownloadIDs
+
+        if selectedIDs.isEmpty {
+            showUninstallSummarySheet = false
+            startUninstall(exportDestination: nil, selectedDownloadItemIDs: [])
+            return
+        }
+
+        guard let destinationURL = selectExportDirectory() else { return }
+        showUninstallSummarySheet = false
+        startUninstall(exportDestination: destinationURL, selectedDownloadItemIDs: selectedIDs)
+    }
+
+    private func loadCachedDownloadsForSummary() async {
+        loadingCachedDownloads = true
+        defer { loadingCachedDownloads = false }
+
+        guard let downloadManager = try? DownloadManager() else {
+            cachedDownloads = []
+            return
+        }
+
+        let records = await downloadManager.allDownloads()
+        cachedDownloads = records.map { record in
+            let title = record.itemTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let author = record.itemAuthor?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedTitle = (title?.isEmpty == false) ? (title ?? record.localFileName) : record.localFileName
+            let resolvedAuthor = (author?.isEmpty == false) ? (author ?? "Unknown author") : "Unknown author"
+            return CachedDownloadSelection(
+                id: record.itemID,
+                title: resolvedTitle,
+                author: resolvedAuthor,
+                selected: false
+            )
+        }
+    }
+
+    private func startUninstall(exportDestination: URL?, selectedDownloadItemIDs: Set<String>) {
+        guard !uninstallInProgress else { return }
+        uninstallInProgress = true
+
+        Task { @MainActor in
+            do {
+                uninstallStepStates = Dictionary(
+                    uniqueKeysWithValues: UninstallStep.allCases.map { ($0, .pending) }
+                )
+                showUninstallProgressSheet = true
+
+                try UninstallCoordinator.prepareAndLaunchUninstall(
+                    exportDownloadsTo: exportDestination,
+                    selectedDownloadItemIDs: selectedDownloadItemIDs
+                ) { step, started in
+                    Task { @MainActor in
+                        uninstallStepStates[step] = started ? .inProgress : .complete
+                    }
+                }
+                NSApp.terminate(nil)
+            } catch {
+                uninstallInProgress = false
+                showUninstallProgressSheet = false
+                if let running = uninstallStepStates.first(where: { $0.value == .inProgress })?.key {
+                    uninstallStepStates[running] = .failed
+                }
+                uninstallErrorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+        }
+    }
+
+    private func selectExportDirectory() -> URL? {
+        let panel = NSOpenPanel()
+        panel.title = "Export Downloaded Books"
+        panel.message = "Choose a folder to move downloaded books before uninstall."
+        panel.prompt = "Choose Folder"
+        panel.canCreateDirectories = true
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+
+        let response = panel.runModal()
+        guard response == .OK else { return nil }
+        return panel.url
     }
 }

@@ -4,6 +4,7 @@ import AppKit
 enum SettingsTab: String, CaseIterable, Identifiable {
     case playback
     case shortcuts
+    case maintenance
 
     var id: String { rawValue }
 }

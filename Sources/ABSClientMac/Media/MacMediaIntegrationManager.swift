@@ -1,6 +1,7 @@
 import Foundation
 import MediaPlayer
 import UserNotifications
+import AppKit
 
 extension Notification.Name {
     static let absMediaPlay = Notification.Name("abs.media.play")
@@ -12,6 +13,15 @@ extension Notification.Name {
     static let absMediaSkipForwardOneSecond = Notification.Name("abs.media.skipForwardOneSecond")
     static let absMediaPreviousChapter = Notification.Name("abs.media.previousChapter")
     static let absMediaNextChapter = Notification.Name("abs.media.nextChapter")
+    static let absDockOpenSettings = Notification.Name("abs.dock.openSettings")
+    static let absDockSyncProgressNow = Notification.Name("abs.dock.syncProgressNow")
+    static let absDockOpenDownloadCache = Notification.Name("abs.dock.openDownloadCache")
+    static let absDockShowNowPlaying = Notification.Name("abs.dock.showNowPlaying")
+    static let absDockBrowseBooks = Notification.Name("abs.dock.browseBooks")
+    static let absDockBrowseAuthors = Notification.Name("abs.dock.browseAuthors")
+    static let absDockBrowseSeries = Notification.Name("abs.dock.browseSeries")
+    static let absDockBrowseContinue = Notification.Name("abs.dock.browseContinue")
+    static let absDockBrowseDownloaded = Notification.Name("abs.dock.browseDownloaded")
 }
 
 @MainActor
@@ -38,7 +48,8 @@ final class MacMediaIntegrationManager {
         elapsedSeconds: TimeInterval,
         duration: TimeInterval?,
         playbackRate: Double,
-        isPlaying: Bool
+        isPlaying: Bool,
+        artworkImage: NSImage?
     ) {
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: title,
@@ -52,6 +63,13 @@ final class MacMediaIntegrationManager {
 
         if let duration {
             info[MPMediaItemPropertyPlaybackDuration] = duration
+        }
+
+        if let artworkImage {
+            let artwork = MPMediaItemArtwork(boundsSize: artworkImage.size) { _ in
+                artworkImage
+            }
+            info[MPMediaItemPropertyArtwork] = artwork
         }
 
         nowPlayingInfoCenter.nowPlayingInfo = info

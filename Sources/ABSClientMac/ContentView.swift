@@ -22,6 +22,15 @@ struct ContentView: View {
         let source: ProgressHistorySource
         let occurredAt: Date
     }
+
+    private struct StatsSummary {
+        let totalListeningSeconds: TimeInterval
+        let listeningLast7Days: TimeInterval
+        let listeningLast30Days: TimeInterval
+        let startedCount: Int
+        let completedCount: Int
+        let currentStreakDays: Int
+    }
     private struct PrecisionScrubber: View {
         @Binding var value: Double
         let range: ClosedRange<Double>
@@ -159,6 +168,14 @@ struct ContentView: View {
         case favorites = "Favorites"
         case books = "Books"
         case downloaded = "Downloaded"
+        case stats = "Stats"
+    }
+
+    private enum StatsScope: String, CaseIterable, Identifiable {
+        case currentLibrary = "Current Library"
+        case allLoadedLibraries = "All Loaded Libraries"
+
+        var id: String { rawValue }
     }
 
     private enum BookSortOption: String, CaseIterable, Identifiable {
@@ -187,6 +204,82 @@ struct ContentView: View {
         var id: String { rawValue }
     }
 
+    private enum FilterMode: String, CaseIterable, Identifiable {
+        case quick = "Quick"
+        case advanced = "Advanced"
+
+        var id: String { rawValue }
+    }
+
+    private enum AdvancedFilterMatchMode: String, CaseIterable, Identifiable {
+        case all = "AND (All Rules)"
+        case any = "OR (Any Rule)"
+
+        var id: String { rawValue }
+    }
+
+    private enum AdvancedFilterField: String, CaseIterable, Identifiable {
+        case duration = "Duration"
+        case publishedYear = "Publication Year"
+        case title = "Title"
+        case author = "Author"
+
+        var id: String { rawValue }
+    }
+
+    private enum AdvancedFilterOperator: String, CaseIterable, Identifiable {
+        case equals = "="
+        case notEquals = "!="
+        case greaterThan = ">"
+        case greaterThanOrEqual = ">="
+        case lessThan = "<"
+        case lessThanOrEqual = "<="
+        case contains = "contains"
+        case notContains = "not contains"
+        case startsWith = "starts with"
+        case endsWith = "ends with"
+
+        var id: String { rawValue }
+    }
+
+    private enum AdvancedDurationUnit: String, CaseIterable, Identifiable {
+        case seconds = "Seconds"
+        case minutes = "Minutes"
+        case hours = "Hours"
+
+        var id: String { rawValue }
+
+        var multiplier: Double {
+            switch self {
+            case .seconds: return 1
+            case .minutes: return 60
+            case .hours: return 3600
+            }
+        }
+    }
+
+    private struct AdvancedFilterRule: Identifiable, Hashable {
+        let id: UUID
+        var field: AdvancedFilterField
+        var operation: AdvancedFilterOperator
+        var value: String
+        var durationUnit: AdvancedDurationUnit
+
+        init(
+            id: UUID = UUID(),
+            field: AdvancedFilterField = .duration,
+            operation: AdvancedFilterOperator = .greaterThan,
+            value: String = "",
+            durationUnit: AdvancedDurationUnit = .hours
+        ) {
+            self.id = id
+            self.field = field
+            self.operation = operation
+            self.value = value
+            self.durationUnit = durationUnit
+        }
+    }
+
     private let mediaIntegration = MacMediaIntegrationManager.shared
     private let progressDefaultsKey = "abs.local.progress.v1"
     private let progressHistoryDefaultsKey = "abs.local.progress.history.v1"
@@ -203,19 +296,25 @@ struct ContentView: View {
         .recent,
         .favorites,
         .books,
-        .downloaded
+        .downloaded,
+        .stats
     ]
 
     @EnvironmentObject private var preferences: AppPreferences
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var viewModel = AppViewModel()
     @State private var selectedItemID: ABSCore.LibraryItem.ID?
     @State private var selectedItemIDs: Set<ABSCore.LibraryItem.ID> = []
     @State private var selectedGroupID: String?
     @State private var searchText = ""
     @State private var itemFilter: ItemFilterOption = .all
+    @State private var filterMode: FilterMode = .quick
     @State private var bookSortOption: BookSortOption = .alphabetical
     @State private var groupSortOption: GroupSortOption = .alphabetical
+    @State private var advancedFilterMatchMode: AdvancedFilterMatchMode = .all
+    @State private var advancedFilterRules: [AdvancedFilterRule] = []
+    @State private var showingAdvancedFilterPopover = false
     @State private var playbackSpeed = 1.0
     @State private var isPlaying = false
     @State private var elapsedSeconds = 0.0
@@ -240,6 +339,7 @@ struct ContentView: View {
     @State private var bottomExpandHandleHovered = false
     @State private var bottomExpandDragOffset: CGFloat = 0
     @State private var localProgressByItemID: [String: TimeInterval] = [:]
+    @State private var playedStateByItemID: [String: Bool] = [:]
     @State private var progressHistoryByItemID: [String: [ProgressHistoryEntry]] = [:]
     @State private var favoriteItemIDs: Set<String> = []
     @State private var recentActivityByItemID: [String: Date] = [:]
@@ -248,6 +348,7 @@ struct ContentView: View {
     @State private var downloadBusyItemIDs: Set<String> = []
     @State private var downloadQueuedItemIDs: Set<String> = []
     @State private var downloadProgressByItemID: [String: Double] = [:]
+    @State private var downloadRecoveredStateByItemID: [String: DownloadJobState] = [:]
     @State private var isClearingDownloads = false
     @State private var downloadMenuPage = 0
     @State private var showingDownloadsPopover = false
@@ -260,6 +361,10 @@ struct ContentView: View {
     @State private var isTimelineScrubbing = false
     @State private var scrubPreviewSeconds: TimeInterval?
     @State private var progressHydrationTask: Task<Void, Never>?
+    @State private var liveUpdateTask: Task<Void, Never>?
+    @State private var lastLiveUpdateAt: Date?
+    @State private var statsScope: StatsScope = .currentLibrary
+    @State private var hasAttemptedDownloadRecovery = false
 
     var body: some View {
         var view = AnyView(
@@ -300,6 +405,10 @@ struct ContentView: View {
                     .foregroundStyle(viewModel.isAuthenticated ? .green : .secondary)
 
                     Text("Server: \(viewModel.serverAddressDisplay)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Text("Transport: \(transportStatusDisplay)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
@@ -459,6 +568,7 @@ struct ContentView: View {
             await viewModel.bootstrap()
             loadLocalPlaybackMetadata()
             await refreshDownloadedInventory()
+            await recoverPendingDownloadsIfNeeded()
             showingServerSheet = !viewModel.isAuthenticated
             if viewModel.selectedLibraryID == nil {
                 viewModel.selectedLibraryID = viewModel.libraries.first?.id
@@ -485,6 +595,7 @@ struct ContentView: View {
                 await preloadCoverForSelectedItem()
                 await preloadCoverForPlaybackItem()
             }
+            startLiveUpdatesIfNeeded()
         })
 
         view = AnyView(view.onDisappear {
@@ -492,7 +603,16 @@ struct ContentView: View {
             teardownKeyboardMonitor()
             progressHydrationTask?.cancel()
             progressHydrationTask = nil
+            stopLiveUpdates()
         })
+
+        view = AnyView(view.onChange(of: scenePhase, perform: { _ in
+            restartLiveUpdatesIfNeeded()
+        }))
+
+        view = AnyView(view.onChange(of: viewModel.isAuthenticated, perform: { _ in
+            restartLiveUpdatesIfNeeded()
+        }))
 
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { _ in
             isPlaying = false
@@ -606,6 +726,46 @@ struct ContentView: View {
 
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .absMediaNextChapter)) { _ in
             nextChapter()
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .absDockOpenSettings)) { _ in
+            openSettingsWindow(tab: .playback)
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .absDockSyncProgressNow)) { _ in
+            Task {
+                await manualDownloadProgress()
+                await manualUploadProgress()
+            }
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .absDockOpenDownloadCache)) { _ in
+            Task { await openDownloadCacheInFinder() }
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .absDockShowNowPlaying)) { _ in
+            guard playbackDisplayItem != nil else { return }
+            showingNowPlaying = true
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .absDockBrowseBooks)) { _ in
+            selectDockBrowseTab(.books)
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .absDockBrowseAuthors)) { _ in
+            selectDockBrowseTab(.authors)
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .absDockBrowseSeries)) { _ in
+            selectDockBrowseTab(.series)
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .absDockBrowseContinue)) { _ in
+            selectDockBrowseTab(.continueListening)
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .absDockBrowseDownloaded)) { _ in
+            selectDockBrowseTab(.downloaded)
         })
 
         view = AnyView(view.alert("Connection Error", isPresented: Binding(
@@ -809,45 +969,93 @@ struct ContentView: View {
 
     private var itemListHeader: some View {
         HStack(spacing: 12) {
-            HStack(spacing: 6) {
-                Text("Sort")
-                    .foregroundStyle(.secondary)
-                Picker("Sort", selection: sortPickerSelectionBinding) {
-                    if isBookListTab {
-                        ForEach(BookSortOption.allCases) { option in
-                            Text(option.rawValue).tag(option.rawValue)
-                        }
-                    } else {
-                        ForEach(GroupSortOption.allCases) { option in
-                            Text(option.rawValue).tag(option.rawValue)
+            if currentBrowseTab == .stats {
+                HStack(spacing: 6) {
+                    Text("Scope")
+                        .foregroundStyle(.secondary)
+                    Picker("Scope", selection: $statsScope) {
+                        ForEach(StatsScope.allCases) { scope in
+                            Text(scope.rawValue).tag(scope)
                         }
                     }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
                 }
-                .pickerStyle(.menu)
-                .labelsHidden()
-            }
 
-            HStack(spacing: 6) {
-                Text("Filter")
-                    .foregroundStyle(.secondary)
-                Picker("Filter", selection: $itemFilter) {
-                    ForEach(ItemFilterOption.allCases) { option in
-                        Text(option.rawValue).tag(option)
+                if let statsLastUpdatedAt {
+                    Text("Last updated: \(formattedSyncTimestamp(statsLastUpdatedAt))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Last updated: Pending")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                HStack(spacing: 6) {
+                    Text("Sort")
+                        .foregroundStyle(.secondary)
+                    Picker("Sort", selection: sortPickerSelectionBinding) {
+                        if isBookListTab {
+                            ForEach(BookSortOption.allCases) { option in
+                                Text(option.rawValue).tag(option.rawValue)
+                            }
+                        } else {
+                            ForEach(GroupSortOption.allCases) { option in
+                                Text(option.rawValue).tag(option.rawValue)
+                            }
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                }
+
+                HStack(spacing: 6) {
+                    Text("Filter")
+                        .foregroundStyle(.secondary)
+                    Picker("Filter", selection: $itemFilter) {
+                        ForEach(ItemFilterOption.allCases) { option in
+                            Text(option.rawValue).tag(option)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                }
+
+                HStack(spacing: 6) {
+                    Text("Mode")
+                        .foregroundStyle(.secondary)
+                    Picker("Filter Mode", selection: $filterMode) {
+                        ForEach(FilterMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                }
+
+                if filterMode == .advanced {
+                    Button {
+                        showingAdvancedFilterPopover.toggle()
+                    } label: {
+                        Label(advancedFilterSummaryLabel, systemImage: "line.3.horizontal.decrease.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .popover(isPresented: $showingAdvancedFilterPopover, arrowEdge: .top) {
+                        advancedFilterPopoverContent
                     }
                 }
-                .pickerStyle(.menu)
-                .labelsHidden()
-            }
 
-            if currentBrowseTab == .downloaded {
-                Button("Open Cache") {
-                    Task { await openDownloadCacheInFinder() }
-                }
+                if currentBrowseTab == .downloaded {
+                    Button("Open Cache") {
+                        Task { await openDownloadCacheInFinder() }
+                    }
 
-                Button(isClearingDownloads ? "Clearing…" : "Clear Downloads", role: .destructive) {
-                    Task { await clearAllDownloads() }
+                    Button(isClearingDownloads ? "Clearing…" : "Clear Downloads", role: .destructive) {
+                        Task { await clearAllDownloads() }
+                    }
+                    .disabled(isClearingDownloads || downloadedItemIDs.isEmpty)
                 }
-                .disabled(isClearingDownloads || downloadedItemIDs.isEmpty)
             }
 
             Spacer()
@@ -896,6 +1104,10 @@ struct ContentView: View {
     }
 
     private var visibleItemCount: Int {
+        if currentBrowseTab == .stats {
+            return statsSourceItems.count
+        }
+
         if isBookListTab {
             return browsedItems.count
         }
@@ -905,7 +1117,9 @@ struct ContentView: View {
 
     @ViewBuilder
     private var itemListContent: some View {
-        if isBookListTab {
+        if currentBrowseTab == .stats {
+            statsListView
+        } else if isBookListTab {
             booksListView
         } else {
             groupListView
@@ -929,6 +1143,11 @@ struct ContentView: View {
                         Text("Current position at \(formattedClock(savedProgress(for: item.id)))")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    }
+                    if isMarkedPlayed(itemID: item.id, duration: item.duration) {
+                        Text("Played")
+                            .font(.caption)
+                            .foregroundStyle(.green)
                     }
                 }
                 Spacer(minLength: 8)
@@ -962,6 +1181,16 @@ struct ContentView: View {
                             setFavorite(for: contextItemIDs, isFavorite: true)
                         }
                     }
+
+                    Divider()
+
+                    Button("Mark Played (\(contextItemIDs.count))") {
+                        Task { await setPlayedState(for: contextItemIDs, isPlayed: true) }
+                    }
+
+                    Button("Mark Unplayed (\(contextItemIDs.count))") {
+                        Task { await setPlayedState(for: contextItemIDs, isPlayed: false) }
+                    }
                 } else {
                     Button("Start from Beginning") {
                         selectedItemID = item.id
@@ -988,6 +1217,16 @@ struct ContentView: View {
                         clearSavedProgressEverywhere(item: item)
                     }
                     .disabled(!hasSavedProgress(for: item.id))
+
+                    if isMarkedPlayed(itemID: item.id, duration: item.duration) {
+                        Button("Mark Unplayed") {
+                            Task { await setPlayedState(for: [item.id], isPlayed: false) }
+                        }
+                    } else {
+                        Button("Mark Played") {
+                            Task { await setPlayedState(for: [item.id], isPlayed: true) }
+                        }
+                    }
 
                     Divider()
 
@@ -1022,6 +1261,65 @@ struct ContentView: View {
                 play(item: item, startPosition: resumePosition > 0 ? resumePosition : nil)
             }
         }
+    }
+
+    private var statsListView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 12) {
+                    statsCard(
+                        title: "Total Listening",
+                        value: formattedDuration(statsSummary.totalListeningSeconds)
+                    )
+                    statsCard(
+                        title: "Last 7 Days",
+                        value: formattedDuration(statsSummary.listeningLast7Days)
+                    )
+                    statsCard(
+                        title: "Last 30 Days",
+                        value: formattedDuration(statsSummary.listeningLast30Days)
+                    )
+                }
+
+                HStack(spacing: 12) {
+                    statsCard(title: "Started", value: "\(statsSummary.startedCount)")
+                    statsCard(title: "Completed", value: "\(statsSummary.completedCount)")
+                    statsCard(title: "Current Streak", value: "\(statsSummary.currentStreakDays) day\(statsSummary.currentStreakDays == 1 ? "" : "s")")
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Window Labels")
+                        .font(.headline)
+                    Text("Last 7 Days and Last 30 Days are based on locally recorded listening deltas from progress history.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Scope: \(statsScope.rawValue)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.secondary.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            .padding(16)
+        }
+    }
+
+    private func statsCard(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title3.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     @ViewBuilder
@@ -1259,6 +1557,10 @@ struct ContentView: View {
                             }
 
                             detailRow(title: "Duration", value: formattedDuration(item.duration))
+                            detailRow(
+                                title: "Status",
+                                value: isMarkedPlayed(itemID: item.id, duration: item.duration) ? "Played" : "Unplayed"
+                            )
                             if let author = authorDisplayValue(for: item) {
                                 detailRow(title: "Author", value: author)
                             }
@@ -1912,6 +2214,60 @@ struct ContentView: View {
             .map { $0 }
     }
 
+    private var statsSourceItems: [ABSCore.LibraryItem] {
+        let raw: [ABSCore.LibraryItem]
+        switch statsScope {
+        case .currentLibrary:
+            raw = viewModel.currentLibraryItems
+        case .allLoadedLibraries:
+            raw = viewModel.allKnownItems()
+        }
+
+        let deduped = Dictionary(grouping: raw, by: \.id).compactMap { $0.value.first }
+        return deduped
+    }
+
+    private var statsSummary: StatsSummary {
+        let itemIDs = Set(statsSourceItems.map(\.id))
+        let now = Date()
+        let sevenDaysAgo = Calendar.current.date(byAdding: .day, value: -7, to: now)
+        let thirtyDaysAgo = Calendar.current.date(byAdding: .day, value: -30, to: now)
+
+        var started = 0
+        var completed = 0
+        var totalListeningSeconds: TimeInterval = 0
+
+        for item in statsSourceItems {
+            let progress = savedProgress(for: item.id)
+            if progress > 0 {
+                started += 1
+                totalListeningSeconds += progress
+            }
+            if let duration = item.duration, duration > 1, progress >= (duration - 1) {
+                completed += 1
+            }
+        }
+
+        let deltasByDay = listeningDeltasByDay(for: itemIDs)
+        let listeningLast7Days = listeningSecondsFromDeltas(deltasByDay, since: sevenDaysAgo)
+        let listeningLast30Days = listeningSecondsFromDeltas(deltasByDay, since: thirtyDaysAgo)
+        let currentStreak = streakFromDeltas(deltasByDay)
+
+        return StatsSummary(
+            totalListeningSeconds: totalListeningSeconds,
+            listeningLast7Days: listeningLast7Days,
+            listeningLast30Days: listeningLast30Days,
+            startedCount: started,
+            completedCount: completed,
+            currentStreakDays: currentStreak
+        )
+    }
+
+    private var statsLastUpdatedAt: Date? {
+        let candidates: [Date?] = [viewModel.lastProgressSyncAt, lastLiveUpdateAt]
+        return candidates.compactMap { $0 }.max()
+    }
+
     private var browsedItems: [ABSCore.LibraryItem] {
         let items = filteredBaseItems
         switch currentBrowseTab {
@@ -1995,6 +2351,8 @@ struct ContentView: View {
                     }
                     return lhsDate > rhsDate
                 })
+        case .stats:
+            return []
         }
     }
 
@@ -2041,6 +2399,8 @@ struct ContentView: View {
         case .recent:
             let filtered = items.filter { recentActivityByItemID[$0.id] != nil }
             return groupedRows(from: filtered, key: recentBucketName(for:))
+        case .stats:
+            return []
         }
     }
 
@@ -2062,6 +2422,10 @@ struct ContentView: View {
                 selectedItemID = browsedItems.first?.id
                 selectedItemIDs = selectedItemID.map { [$0] } ?? []
                 selectedGroupID = nil
+            } else if browseTab == .stats {
+                selectedItemID = nil
+                selectedItemIDs = []
+                selectedGroupID = nil
             } else {
                 selectedGroupID = displayedBrowseGroups.first?.id
                 selectedItemID = nil
@@ -2073,6 +2437,12 @@ struct ContentView: View {
     private func selectCurrentLibraryBrowseTab(_ browseTab: LibraryBrowseTab) {
         guard let currentLibraryID = viewModel.selectedLibraryID else { return }
         browseTabByLibraryID[currentLibraryID] = browseTab
+    }
+
+    private func selectDockBrowseTab(_ browseTab: LibraryBrowseTab) {
+        let targetLibraryID = viewModel.selectedLibraryID ?? viewModel.libraries.first?.id
+        guard let targetLibraryID else { return }
+        selectLibrary(libraryID: targetLibraryID, browseTab: browseTab)
     }
 
     private func navigateToBrowseGroup(tab: LibraryBrowseTab, groupID: String) {
@@ -2099,12 +2469,13 @@ struct ContentView: View {
     }
 
     private var filteredBaseItems: [ABSCore.LibraryItem] {
-        let items = viewModel.displayedItems
+        let base = viewModel.displayedItems
+        let quickFiltered: [ABSCore.LibraryItem]
         switch itemFilter {
         case .all:
-            return items
+            quickFiltered = base
         case .inProgress:
-            return items.filter { item in
+            quickFiltered = base.filter { item in
                 let progress = savedProgress(for: item.id)
                 guard progress > 0 else { return false }
                 if let duration = item.duration, duration > 0 {
@@ -2113,7 +2484,205 @@ struct ContentView: View {
                 return true
             }
         case .favorites:
-            return items.filter { favoriteItemIDs.contains($0.id) }
+            quickFiltered = base.filter { favoriteItemIDs.contains($0.id) }
+        }
+
+        guard filterMode == .advanced else {
+            return quickFiltered
+        }
+        return applyAdvancedFilters(to: quickFiltered)
+    }
+
+    private var advancedFilterSummaryLabel: String {
+        let activeCount = activeAdvancedFilterRules.count
+        if activeCount == 0 {
+            return "Advanced Filter"
+        }
+        let mode = advancedFilterMatchMode == .all ? "AND" : "OR"
+        return "\(activeCount) Rule\(activeCount == 1 ? "" : "s") • \(mode)"
+    }
+
+    private var activeAdvancedFilterRules: [AdvancedFilterRule] {
+        advancedFilterRules.filter { !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    @ViewBuilder
+    private var advancedFilterPopoverContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Advanced Filter")
+                .font(.headline)
+
+            HStack(spacing: 8) {
+                Text("Match")
+                    .foregroundStyle(.secondary)
+                Picker("Match Mode", selection: $advancedFilterMatchMode) {
+                    ForEach(AdvancedFilterMatchMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if advancedFilterRules.isEmpty {
+                Text("No rules yet. Add a rule to filter by duration, publication year, title, or author.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(spacing: 10) {
+                    ForEach($advancedFilterRules) { $rule in
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 8) {
+                                Picker("Field", selection: $rule.field) {
+                                    ForEach(AdvancedFilterField.allCases) { field in
+                                        Text(field.rawValue).tag(field)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .frame(width: 150)
+                                .onChange(of: rule.field, perform: { newField in
+                                    let supported = supportedOperators(for: newField)
+                                    if !supported.contains(rule.operation), let first = supported.first {
+                                        rule.operation = first
+                                    }
+                                })
+
+                                Picker("Operator", selection: $rule.operation) {
+                                    ForEach(supportedOperators(for: rule.field)) { op in
+                                        Text(op.rawValue).tag(op)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .frame(width: 140)
+
+                                if rule.field == .duration {
+                                    TextField("Value", text: $rule.value)
+                                        .textFieldStyle(.roundedBorder)
+                                        .frame(width: 90)
+                                    Picker("Unit", selection: $rule.durationUnit) {
+                                        ForEach(AdvancedDurationUnit.allCases) { unit in
+                                            Text(unit.rawValue).tag(unit)
+                                        }
+                                    }
+                                    .pickerStyle(.menu)
+                                    .frame(width: 120)
+                                } else {
+                                    TextField(rule.field == .publishedYear ? "Year" : "Value", text: $rule.value)
+                                        .textFieldStyle(.roundedBorder)
+                                }
+
+                                Button(role: .destructive) {
+                                    advancedFilterRules.removeAll { $0.id == rule.id }
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                }
+            }
+
+            HStack {
+                Button("Add Rule") {
+                    advancedFilterRules.append(AdvancedFilterRule())
+                }
+                Button("Clear Rules", role: .destructive) {
+                    advancedFilterRules = []
+                }
+                .disabled(advancedFilterRules.isEmpty)
+                Spacer()
+                Button("Done") {
+                    showingAdvancedFilterPopover = false
+                }
+            }
+        }
+        .padding(14)
+        .frame(minWidth: 640)
+    }
+
+    private func supportedOperators(for field: AdvancedFilterField) -> [AdvancedFilterOperator] {
+        switch field {
+        case .duration, .publishedYear:
+            return [.equals, .notEquals, .greaterThan, .greaterThanOrEqual, .lessThan, .lessThanOrEqual]
+        case .title, .author:
+            return [.equals, .notEquals, .contains, .notContains, .startsWith, .endsWith]
+        }
+    }
+
+    private func applyAdvancedFilters(to items: [ABSCore.LibraryItem]) -> [ABSCore.LibraryItem] {
+        let rules = activeAdvancedFilterRules
+        guard !rules.isEmpty else { return items }
+
+        return items.filter { item in
+            let matches = rules.map { evaluateAdvancedFilter(rule: $0, item: item) }
+            switch advancedFilterMatchMode {
+            case .all:
+                return matches.allSatisfy { $0 }
+            case .any:
+                return matches.contains(true)
+            }
+        }
+    }
+
+    private func evaluateAdvancedFilter(rule: AdvancedFilterRule, item: ABSCore.LibraryItem) -> Bool {
+        switch rule.field {
+        case .duration:
+            guard let lhs = item.duration, lhs > 0 else { return false }
+            guard let rhsInput = Double(rule.value.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
+            let rhs = rhsInput * rule.durationUnit.multiplier
+            return compareNumeric(lhs: lhs, rhs: rhs, operation: rule.operation)
+        case .publishedYear:
+            guard let lhs = item.publishedYear else { return false }
+            guard let rhs = Int(rule.value.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
+            return compareNumeric(lhs: Double(lhs), rhs: Double(rhs), operation: rule.operation)
+        case .title:
+            return compareText(lhs: item.title, rhs: rule.value, operation: rule.operation)
+        case .author:
+            let lhs = displayAuthorNames(for: item).joined(separator: ", ")
+            return compareText(lhs: lhs, rhs: rule.value, operation: rule.operation)
+        }
+    }
+
+    private func compareNumeric(lhs: Double, rhs: Double, operation: AdvancedFilterOperator) -> Bool {
+        switch operation {
+        case .equals:
+            return abs(lhs - rhs) < 0.0001
+        case .notEquals:
+            return abs(lhs - rhs) >= 0.0001
+        case .greaterThan:
+            return lhs > rhs
+        case .greaterThanOrEqual:
+            return lhs >= rhs
+        case .lessThan:
+            return lhs < rhs
+        case .lessThanOrEqual:
+            return lhs <= rhs
+        case .contains, .notContains, .startsWith, .endsWith:
+            return false
+        }
+    }
+
+    private func compareText(lhs: String, rhs: String, operation: AdvancedFilterOperator) -> Bool {
+        let left = lhs.lowercased()
+        let right = rhs.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !right.isEmpty else { return true }
+
+        switch operation {
+        case .equals:
+            return left == right
+        case .notEquals:
+            return left != right
+        case .contains:
+            return left.contains(right)
+        case .notContains:
+            return !left.contains(right)
+        case .startsWith:
+            return left.hasPrefix(right)
+        case .endsWith:
+            return left.hasSuffix(right)
+        case .greaterThan, .greaterThanOrEqual, .lessThan, .lessThanOrEqual:
+            return false
         }
     }
 
@@ -2182,6 +2751,13 @@ struct ContentView: View {
     }
 
     private func refreshSelectionForCurrentBrowseContext() {
+        if currentBrowseTab == .stats {
+            selectedItemID = nil
+            selectedItemIDs = []
+            selectedGroupID = nil
+            return
+        }
+
         if isBookListTab {
             let visibleIDs = Set(browsedItems.map(\.id))
             selectedItemIDs = selectedItemIDs.intersection(visibleIDs)
@@ -2297,6 +2873,22 @@ struct ContentView: View {
                 }
                 .disabled(selectedVisibleItemIDs.isEmpty)
             }
+
+            Divider()
+
+            Button("Mark Played (\(selectedVisibleItemIDs.count))") {
+                let ids = selectedVisibleItemIDs
+                showingBulkActionsPopover = false
+                Task { await setPlayedState(for: ids, isPlayed: true) }
+            }
+            .disabled(selectedVisibleItemIDs.isEmpty)
+
+            Button("Mark Unplayed (\(selectedVisibleItemIDs.count))") {
+                let ids = selectedVisibleItemIDs
+                showingBulkActionsPopover = false
+                Task { await setPlayedState(for: ids, isPlayed: false) }
+            }
+            .disabled(selectedVisibleItemIDs.isEmpty)
         }
         .padding(12)
         .frame(width: 290, alignment: .leading)
@@ -2737,7 +3329,10 @@ struct ContentView: View {
     }
 
     private var downloadMenuItemIDs: [String] {
-        let allIDs = Set(downloadedItemIDs).union(downloadBusyItemIDs).union(downloadQueuedItemIDs)
+        let allIDs = Set(downloadedItemIDs)
+            .union(downloadBusyItemIDs)
+            .union(downloadQueuedItemIDs)
+            .union(downloadRecoveredStateByItemID.keys)
         return allIDs.sorted { lhs, rhs in
             let lhsBusy = downloadBusyItemIDs.contains(lhs)
             let rhsBusy = downloadBusyItemIDs.contains(rhs)
@@ -2758,6 +3353,22 @@ struct ContentView: View {
     private func downloadDisplayTitle(for itemID: String) -> String {
         guard let item = viewModel.item(withID: itemID) else { return itemID }
         return item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? itemID : item.title
+    }
+
+    private func downloadRecoveryLabel(for itemID: String) -> String? {
+        guard let state = downloadRecoveredStateByItemID[itemID] else { return nil }
+        switch state {
+        case .queued:
+            return "Queued"
+        case .downloading:
+            return "Downloading…"
+        case .recovered:
+            return "Recovered after relaunch"
+        case .restarted:
+            return "Restarted after relaunch"
+        case .failed:
+            return "Failed (tap item to retry)"
+        }
     }
 
     @ViewBuilder
@@ -2821,6 +3432,10 @@ struct ContentView: View {
                                         downloadLinearProgressBar(progress: progress)
                                         Text("\(Int(max(0, min(progress, 1)) * 100))%")
                                             .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    } else if let recoveryLabel = downloadRecoveryLabel(for: itemID) {
+                                        Text(recoveryLabel)
+                                            .font(.caption)
                                             .foregroundStyle(.secondary)
                                     } else if downloadQueuedItemIDs.contains(itemID) {
                                         Text("Queued")
@@ -3281,6 +3896,7 @@ struct ContentView: View {
             await viewModel.connect()
             if viewModel.isAuthenticated {
                 showingServerSheet = false
+                await recoverPendingDownloadsIfNeeded()
                 if let selectedLibraryID = viewModel.selectedLibraryID, browseTabByLibraryID[selectedLibraryID] == nil {
                     browseTabByLibraryID[selectedLibraryID] = .books
                 }
@@ -3398,7 +4014,8 @@ struct ContentView: View {
             elapsedSeconds: elapsedSeconds,
             duration: item.duration,
             playbackRate: playbackSpeed,
-            isPlaying: isPlaying
+            isPlaying: isPlaying,
+            artworkImage: coverImagesByItemID[item.id]
         )
     }
 
@@ -3471,17 +4088,28 @@ struct ContentView: View {
     }
 
     private func syncSelectedItemProgressFromServer() async {
-        guard let item = selectedItem else { return }
-        let local = savedProgress(for: item.id)
-        let resolved = await viewModel.resolvePlaybackPosition(
-            itemID: item.id,
-            localPosition: local,
-            durationSeconds: item.duration
-        )
-        if abs(resolved - local) > 0.5 {
-            persistProgress(itemID: item.id, seconds: resolved, source: .absServer)
-            if activeItemID == item.id, !isTimelineScrubbing {
-                elapsedSeconds = resolved
+        let target = await MainActor.run { () -> (itemID: String, duration: TimeInterval?)? in
+            guard let item = selectedItem else { return nil }
+            return (item.id, item.duration)
+        }
+        guard let target else { return }
+
+        let local = await MainActor.run { savedProgress(for: target.itemID) }
+        if let remote = try? await viewModel.fetchProgress(itemID: target.itemID) {
+            let remotePosition = max(0, remote.positionSeconds)
+            if abs(remotePosition - local) > 0.5 {
+                await MainActor.run {
+                    persistProgress(itemID: target.itemID, seconds: remotePosition, source: .absServer)
+                    if activeItemID == target.itemID, !isTimelineScrubbing {
+                        elapsedSeconds = remotePosition
+                    }
+                }
+            }
+
+            if let finished = remote.isFinished {
+                await MainActor.run {
+                    playedStateByItemID[target.itemID] = finished
+                }
             }
         }
     }
@@ -3556,6 +4184,74 @@ struct ContentView: View {
         return absoluteFormatter.string(from: date)
     }
 
+    private var transportStatusDisplay: String {
+        guard viewModel.isAuthenticated else { return "Unavailable" }
+        guard let probe = viewModel.liveTransportProbe else { return "Probing…" }
+
+        switch probe.recommended {
+        case .webSocket:
+            return "WebSocket"
+        case .serverSentEvents:
+            return "Server-Sent Events"
+        case .polling:
+            return "Polling"
+        }
+    }
+
+    private func listeningDeltasByDay(for itemIDs: Set<String>) -> [Date: TimeInterval] {
+        guard !itemIDs.isEmpty else { return [:] }
+        let calendar = Calendar.current
+        var totals: [Date: TimeInterval] = [:]
+
+        for itemID in itemIDs {
+            let history = (progressHistoryByItemID[itemID] ?? [])
+                .sorted { $0.occurredAt < $1.occurredAt }
+            guard !history.isEmpty else { continue }
+
+            var previousPosition: TimeInterval = 0
+            for entry in history {
+                if entry.source == .appClear {
+                    previousPosition = 0
+                    continue
+                }
+                let delta = max(0, entry.positionSeconds - previousPosition)
+                previousPosition = entry.positionSeconds
+                guard delta > 0 else { continue }
+                let day = calendar.startOfDay(for: entry.occurredAt)
+                totals[day, default: 0] += delta
+            }
+        }
+
+        return totals
+    }
+
+    private func listeningSecondsFromDeltas(_ deltasByDay: [Date: TimeInterval], since: Date?) -> TimeInterval {
+        guard let since else {
+            return deltasByDay.values.reduce(0, +)
+        }
+        let thresholdDay = Calendar.current.startOfDay(for: since)
+        return deltasByDay
+            .filter { $0.key >= thresholdDay }
+            .map(\.value)
+            .reduce(0, +)
+    }
+
+    private func streakFromDeltas(_ deltasByDay: [Date: TimeInterval]) -> Int {
+        guard !deltasByDay.isEmpty else { return 0 }
+        let calendar = Calendar.current
+        let activeDays = Set(deltasByDay.keys.map { calendar.startOfDay(for: $0) })
+        var day = calendar.startOfDay(for: Date())
+        var streak = 0
+
+        while activeDays.contains(day) {
+            streak += 1
+            guard let previous = calendar.date(byAdding: .day, value: -1, to: day) else { break }
+            day = previous
+        }
+
+        return streak
+    }
+
     private func appendProgressHistory(itemID: String, positionSeconds: TimeInterval, source: ProgressHistorySource) {
         let entry = ProgressHistoryEntry(
             id: UUID(),
@@ -3581,6 +4277,109 @@ struct ContentView: View {
 
         progressHydrationTask = Task {
             await hydrateProgressFromServer(for: candidates)
+        }
+    }
+
+    private func startLiveUpdatesIfNeeded() {
+        guard liveUpdateTask == nil else { return }
+        guard viewModel.isAuthenticated else { return }
+
+        liveUpdateTask = Task {
+            let eventStream = await viewModel.liveUpdateEvents()
+            var eventDrivenTask: Task<Void, Never>?
+
+            if let eventStream {
+                eventDrivenTask = Task {
+                    var eventCount = 0
+                    var lastEventDrivenTick: Date?
+                    do {
+                        // Prime with an initial refresh to avoid stale state while waiting for first event.
+                        await performLiveUpdateTick(refreshLibraries: true)
+
+                        for try await _ in eventStream {
+                            if Task.isCancelled { break }
+                            let shouldRunNow = await MainActor.run { scenePhase == .active && viewModel.isAuthenticated }
+                            guard shouldRunNow else { continue }
+
+                            let now = Date()
+                            if let last = lastEventDrivenTick, now.timeIntervalSince(last) < 1.0 {
+                                // Coalesce noisy transport bursts.
+                                continue
+                            }
+                            lastEventDrivenTick = now
+
+                            let refreshLibraries = (eventCount % 12) == 0
+                            await performLiveUpdateTick(refreshLibraries: refreshLibraries)
+                            eventCount += 1
+                        }
+                    } catch {
+                        // Transport stream failed; periodic fallback loop below remains active.
+                    }
+                }
+            }
+
+            // Periodic reconciliation path always runs, even with live events.
+            // This ensures server-side progress/played-state changes still land when transport
+            // does not emit an item-progress event for a given action.
+            let selectedItemReconcileIntervalWithLiveTransport: Duration = .seconds(3)
+            let fallbackPollingInterval: Duration = .seconds(15)
+            var tick = 0
+            while !Task.isCancelled {
+                let shouldRunNow = await MainActor.run { scenePhase == .active && viewModel.isAuthenticated }
+                if shouldRunNow {
+                    if eventStream == nil {
+                        let refreshLibraries = (tick % 4) == 0
+                        await performLiveUpdateTick(refreshLibraries: refreshLibraries)
+                        try? await Task.sleep(for: fallbackPollingInterval)
+                    } else {
+                        await syncSelectedItemProgressFromServer()
+                        try? await Task.sleep(for: selectedItemReconcileIntervalWithLiveTransport)
+                    }
+                    tick += 1
+                } else {
+                    try? await Task.sleep(for: .seconds(30))
+                }
+            }
+
+            eventDrivenTask?.cancel()
+        }
+    }
+
+    private func stopLiveUpdates() {
+        liveUpdateTask?.cancel()
+        liveUpdateTask = nil
+    }
+
+    private func restartLiveUpdatesIfNeeded() {
+        stopLiveUpdates()
+        startLiveUpdatesIfNeeded()
+    }
+
+    private func performLiveUpdateTick(refreshLibraries: Bool) async {
+        guard viewModel.isAuthenticated else { return }
+        let currentSearchQuery = await MainActor.run { trimmedSearchText }
+        let selectedID = await MainActor.run { selectedItemID }
+
+        if refreshLibraries {
+            // Keep library metadata current without replacing the currently filtered list.
+            try? await viewModel.refreshLibrariesMetadataOnly()
+        }
+        // Always refresh the current browse/search context in one pass.
+        await viewModel.liveRefreshCurrentContext(searchQuery: currentSearchQuery)
+        if let selectedID {
+            // Ensure selected item metadata/progress stays fresh without requiring reselection.
+            await viewModel.refreshDetailsForSelectedItem(itemID: selectedID)
+        }
+
+        await syncSelectedItemProgressFromServer()
+        await refreshDownloadedInventory()
+        await refreshDownloadStates(for: viewModel.displayedItems.map(\.id))
+        await MainActor.run {
+            lastLiveUpdateAt = Date()
+            // Defer selection normalization to avoid reentrant NSTableView delegate updates.
+            DispatchQueue.main.async {
+                refreshSelectionForCurrentBrowseContext()
+            }
         }
     }
 
@@ -3614,9 +4413,35 @@ struct ContentView: View {
         }
     }
 
+    private func recoverPendingDownloadsIfNeeded() async {
+        guard viewModel.isAuthenticated else { return }
+        guard !hasAttemptedDownloadRecovery else { return }
+        hasAttemptedDownloadRecovery = true
+
+        let recovered = await viewModel.recoverPendingDownloadJobs()
+        guard !recovered.isEmpty else { return }
+
+        for job in recovered {
+            downloadRecoveredStateByItemID[job.itemID] = job.state
+        }
+
+        let autoRestartIDs = recovered
+            .filter { $0.state != .failed }
+            .map(\.itemID)
+
+        let queuedNow = autoRestartIDs.filter { !downloadedItemIDs.contains($0) && !downloadBusyItemIDs.contains($0) }
+        downloadQueuedItemIDs.formUnion(queuedNow)
+
+        for itemID in autoRestartIDs {
+            await downloadItem(itemID)
+        }
+    }
+
     private func downloadItem(_ itemID: String) async {
         guard !downloadBusyItemIDs.contains(itemID) else { return }
+        await viewModel.queueDownloadJob(itemID: itemID)
         downloadQueuedItemIDs.remove(itemID)
+        downloadRecoveredStateByItemID[itemID] = .downloading
         downloadBusyItemIDs.insert(itemID)
         downloadProgressByItemID[itemID] = 0
         defer {
@@ -3632,8 +4457,10 @@ struct ContentView: View {
             })
             downloadStateByItemID[itemID] = .downloaded
             downloadedItemIDs.insert(itemID)
+            downloadRecoveredStateByItemID.removeValue(forKey: itemID)
         } catch {
             viewModel.setError("Download failed: \(viewModel.describeError(error))")
+            downloadRecoveredStateByItemID[itemID] = .failed
             await refreshDownloadStates(for: [itemID])
         }
     }
@@ -3696,6 +4523,7 @@ struct ContentView: View {
             try await viewModel.removeDownloadedItem(itemID: itemID)
             downloadStateByItemID[itemID] = .notDownloaded
             downloadedItemIDs.remove(itemID)
+            downloadRecoveredStateByItemID.removeValue(forKey: itemID)
         } catch {
             viewModel.setError("Failed removing download: \(viewModel.describeError(error))")
         }
@@ -3711,6 +4539,7 @@ struct ContentView: View {
             downloadedItemIDs.removeAll()
             downloadQueuedItemIDs.removeAll()
             downloadProgressByItemID.removeAll()
+            downloadRecoveredStateByItemID.removeAll()
             for itemID in downloadStateByItemID.keys {
                 downloadStateByItemID[itemID] = .notDownloaded
             }
@@ -3737,17 +4566,20 @@ struct ContentView: View {
             if Task.isCancelled { return }
 
             let local = savedProgress(for: item.id)
-            let resolved = await viewModel.resolvePlaybackPosition(
-                itemID: item.id,
-                localPosition: local,
-                durationSeconds: item.duration
-            )
+            if let remote = try? await viewModel.fetchProgress(itemID: item.id) {
+                if let finished = remote.isFinished {
+                    await MainActor.run {
+                        playedStateByItemID[item.id] = finished
+                    }
+                }
 
-            if abs(resolved - local) > 0.5 {
-                await MainActor.run {
-                    persistProgress(itemID: item.id, seconds: resolved, source: .absServer)
-                    if activeItemID == item.id, !isTimelineScrubbing {
-                        elapsedSeconds = resolved
+                let remotePosition = max(0, remote.positionSeconds)
+                if abs(remotePosition - local) > 0.5 {
+                    await MainActor.run {
+                        persistProgress(itemID: item.id, seconds: remotePosition, source: .absServer)
+                        if activeItemID == item.id, !isTimelineScrubbing {
+                            elapsedSeconds = remotePosition
+                        }
                     }
                 }
             }
@@ -3768,6 +4600,7 @@ struct ContentView: View {
         playbackChapters = []
         showingNowPlaying = false
         localProgressByItemID = [:]
+        playedStateByItemID = [:]
         progressHistoryByItemID = [:]
         favoriteItemIDs = []
         recentActivityByItemID = [:]
@@ -3776,7 +4609,9 @@ struct ContentView: View {
         downloadBusyItemIDs = []
         downloadQueuedItemIDs = []
         downloadProgressByItemID = [:]
+        downloadRecoveredStateByItemID = [:]
         isClearingDownloads = false
+        hasAttemptedDownloadRecovery = false
         UserDefaults.standard.removeObject(forKey: progressDefaultsKey)
         UserDefaults.standard.removeObject(forKey: progressHistoryDefaultsKey)
         UserDefaults.standard.removeObject(forKey: favoritesDefaultsKey)
@@ -3828,6 +4663,14 @@ struct ContentView: View {
         savedProgress(for: itemID) > 0
     }
 
+    private func isMarkedPlayed(itemID: String, duration: TimeInterval?) -> Bool {
+        if let explicitState = playedStateByItemID[itemID] {
+            return explicitState
+        }
+        guard let duration, duration > 1 else { return false }
+        return savedProgress(for: itemID) >= (duration - 1)
+    }
+
     private func clearSavedProgress(itemID: String) {
         persistProgress(itemID: itemID, seconds: 0, source: .appClear)
         if activeItemID == itemID {
@@ -3837,12 +4680,53 @@ struct ContentView: View {
 
     private func clearSavedProgressEverywhere(item: ABSCore.LibraryItem) {
         clearSavedProgress(itemID: item.id)
+        playedStateByItemID[item.id] = false
         Task {
             _ = await viewModel.uploadProgressToServer(
                 itemID: item.id,
                 positionSeconds: 0,
                 durationSeconds: item.duration
             )
+        }
+    }
+
+    private func setPlayedState(for itemIDs: [String], isPlayed: Bool) async {
+        let unique = Array(Set(itemIDs)).sorted()
+        guard !unique.isEmpty else { return }
+
+        for itemID in unique {
+            guard let item = viewModel.item(withID: itemID) else { continue }
+            let localPosition = savedProgress(for: itemID)
+            guard let pushed = await viewModel.setPlayedState(
+                itemID: itemID,
+                isPlayed: isPlayed,
+                durationSeconds: item.duration,
+                currentPositionSeconds: localPosition
+            ) else {
+                continue
+            }
+
+            await MainActor.run {
+                playedStateByItemID[itemID] = isPlayed
+                let resolvedDuration = pushed.durationSeconds ?? item.duration
+                let localResolvedPosition: TimeInterval = {
+                    if isPlayed {
+                        if let resolvedDuration, resolvedDuration > 0 {
+                            return max(localPosition, resolvedDuration)
+                        }
+                        return max(localPosition, pushed.positionSeconds)
+                    }
+                    return 0
+                }()
+                persistProgress(
+                    itemID: itemID,
+                    seconds: localResolvedPosition,
+                    source: isPlayed ? .manualUpload : .appClear
+                )
+                if activeItemID == itemID, !isPlayed {
+                    seek(to: 0)
+                }
+            }
         }
     }
 
@@ -3873,6 +4757,12 @@ struct ContentView: View {
         let ordered = Array(Set(itemIDs)).sorted()
         let queuedNow = ordered.filter { !downloadBusyItemIDs.contains($0) && !downloadedItemIDs.contains($0) }
         downloadQueuedItemIDs.formUnion(queuedNow)
+        for itemID in queuedNow {
+            await viewModel.queueDownloadJob(itemID: itemID)
+            if downloadRecoveredStateByItemID[itemID] == nil {
+                downloadRecoveredStateByItemID[itemID] = .queued
+            }
+        }
         for itemID in ordered {
             await downloadItem(itemID)
         }
@@ -3952,6 +4842,7 @@ struct ContentView: View {
 
         await MainActor.run {
             coverImagesByItemID[item.id] = image
+            updateNowPlaying()
         }
     }
 

@@ -86,12 +86,20 @@ public struct PlaybackProgress: Codable, Equatable, Sendable {
     public let itemID: String
     public let positionSeconds: TimeInterval
     public let durationSeconds: TimeInterval?
+    public let isFinished: Bool?
     public let updatedAt: Date
 
-    public init(itemID: String, positionSeconds: TimeInterval, durationSeconds: TimeInterval? = nil, updatedAt: Date) {
+    public init(
+        itemID: String,
+        positionSeconds: TimeInterval,
+        durationSeconds: TimeInterval? = nil,
+        isFinished: Bool? = nil,
+        updatedAt: Date
+    ) {
         self.itemID = itemID
         self.positionSeconds = positionSeconds
         self.durationSeconds = durationSeconds
+        self.isFinished = isFinished
         self.updatedAt = updatedAt
     }
 }

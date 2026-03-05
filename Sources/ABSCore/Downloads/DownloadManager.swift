@@ -6,14 +6,65 @@ public struct DownloadRecord: Codable, Equatable, Sendable {
     public let localFileName: String
     public let downloadedAt: Date
     public let fileSize: Int64?
+    public let itemTitle: String?
+    public let itemAuthor: String?
 
-    public init(itemID: String, remoteURL: URL, localFileName: String, downloadedAt: Date, fileSize: Int64?) {
+    public init(
+        itemID: String,
+        remoteURL: URL,
+        localFileName: String,
+        downloadedAt: Date,
+        fileSize: Int64?,
+        itemTitle: String? = nil,
+        itemAuthor: String? = nil
+    ) {
         self.itemID = itemID
         self.remoteURL = remoteURL
         self.localFileName = localFileName
         self.downloadedAt = downloadedAt
         self.fileSize = fileSize
+        self.itemTitle = itemTitle
+        self.itemAuthor = itemAuthor
     }
+}
+
+public enum DownloadJobState: String, Codable, Equatable, Sendable {
+    case queued
+    case downloading
+    case recovered
+    case restarted
+    case failed
+}
+
+public struct DownloadJobRecord: Codable, Equatable, Sendable {
+    public let itemID: String
+    public let itemTitle: String?
+    public let itemAuthor: String?
+    public let state: DownloadJobState
+    public let lastKnownProgress: Double
+    public let updatedAt: Date
+
+    public init(
+        itemID: String,
+        itemTitle: String?,
+        itemAuthor: String?,
+        state: DownloadJobState,
+        lastKnownProgress: Double,
+        updatedAt: Date
+    ) {
+        self.itemID = itemID
+        self.itemTitle = itemTitle
+        self.itemAuthor = itemAuthor
+        self.state = state
+        self.lastKnownProgress = min(max(lastKnownProgress, 0), 1)
+        self.updatedAt = updatedAt
+    }
+}
+
+private struct DownloadManifest: Codable {
+    let version: Int
+    let records: [DownloadRecord]
+    let jobs: [DownloadJobRecord]
 }
 
 public enum DownloadError: Error, LocalizedError {
@@ -201,6 +252,7 @@ public actor DownloadManager {
 
     private var records: [String: DownloadRecord] = [:]
     private var states: [String: DownloadState] = [:]
+    private var jobs: [String: DownloadJobRecord] = [:]
 
     public init(
         storageDirectory: URL? = nil,
@@ -230,24 +282,48 @@ public actor DownloadManager {
         )
         self.records = loaded.records
         self.states = loaded.states
+        self.jobs = loaded.jobs
     }
 
     public func download(
         itemID: String,
         from remoteURL: URL,
         preferredFileName: String? = nil,
+        itemTitle: String? = nil,
+        itemAuthor: String? = nil,
         progress: (@Sendable (Double) async -> Void)? = nil
     ) async throws -> URL {
         if let existing = localFileURL(for: itemID) {
             states[itemID] = .downloaded
+            jobs.removeValue(forKey: itemID)
             await progress?(1.0)
             return existing
         }
 
+        try transitionJob(
+            itemID: itemID,
+            title: itemTitle,
+            author: itemAuthor,
+            state: .downloading,
+            progress: 0
+        )
         states[itemID] = .downloading
 
         do {
-            let tempFileURL = try await transport.download(from: remoteURL, progress: progress)
+            let tempFileURL = try await transport.download(from: remoteURL, progress: { [weak self] reported in
+                guard let self else {
+                    await progress?(reported)
+                    return
+                }
+                try? await self.transitionJob(
+                    itemID: itemID,
+                    title: itemTitle,
+                    author: itemAuthor,
+                    state: .downloading,
+                    progress: reported
+                )
+                await progress?(reported)
+            })
             let destinationURL = destinationURL(
                 for: itemID,
                 remoteURL: remoteURL,
@@ -271,16 +347,25 @@ public actor DownloadManager {
                 remoteURL: remoteURL,
                 localFileName: destinationURL.lastPathComponent,
                 downloadedAt: Date(),
-                fileSize: fileSize
+                fileSize: fileSize,
+                itemTitle: itemTitle,
+                itemAuthor: itemAuthor
             )
 
             records[itemID] = record
             states[itemID] = .downloaded
+            jobs.removeValue(forKey: itemID)
             try persistManifest()
 
             return destinationURL
         } catch {
             states[itemID] = .notDownloaded
+            try transitionJob(
+                itemID: itemID,
+                title: itemTitle,
+                author: itemAuthor,
+                state: .failed
+            )
             throw error
         }
     }
@@ -308,12 +393,80 @@ public actor DownloadManager {
         records.values.sorted { $0.downloadedAt > $1.downloadedAt }
     }
 
+    public func queueDownloadJob(
+        itemID: String,
+        itemTitle: String?,
+        itemAuthor: String?
+    ) throws {
+        guard records[itemID] == nil else { return }
+        try transitionJob(
+            itemID: itemID,
+            title: itemTitle,
+            author: itemAuthor,
+            state: .queued
+        )
+    }
+
+    public func recoverInterruptedJobs() throws -> [DownloadJobRecord] {
+        var didMutate = false
+        var recovered: [DownloadJobRecord] = []
+
+        for (itemID, job) in jobs {
+            if records[itemID] != nil {
+                jobs.removeValue(forKey: itemID)
+                didMutate = true
+                continue
+            }
+
+            let nextState: DownloadJobState
+            switch job.state {
+            case .downloading:
+                nextState = .restarted
+            case .queued:
+                nextState = .recovered
+            case .recovered, .restarted, .failed:
+                nextState = job.state
+            }
+
+            let updated = DownloadJobRecord(
+                itemID: job.itemID,
+                itemTitle: job.itemTitle,
+                itemAuthor: job.itemAuthor,
+                state: nextState,
+                lastKnownProgress: job.lastKnownProgress,
+                updatedAt: Date()
+            )
+
+            if updated != job {
+                jobs[itemID] = updated
+                didMutate = true
+            }
+
+            recovered.append(updated)
+        }
+
+        if didMutate {
+            try persistManifest()
+        }
+
+        return recovered.sorted { lhs, rhs in
+            if lhs.state == .failed, rhs.state != .failed { return false }
+            if lhs.state != .failed, rhs.state == .failed { return true }
+            return lhs.updatedAt > rhs.updatedAt
+        }
+    }
+
+    public func pendingDownloadJobs() -> [DownloadJobRecord] {
+        jobs.values.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
     public func deleteDownload(itemID: String) throws {
         if let localURL = localFileURL(for: itemID), fileManager.fileExists(atPath: localURL.path) {
             try fileManager.removeItem(at: localURL)
         }
 
         records.removeValue(forKey: itemID)
+        jobs.removeValue(forKey: itemID)
         states[itemID] = .notDownloaded
         try persistManifest()
     }
@@ -346,19 +499,27 @@ public actor DownloadManager {
         fileManager: FileManager,
         downloadsDirectory: URL,
         manifestURL: URL
-    ) throws -> (records: [String: DownloadRecord], states: [String: DownloadState]) {
+    ) throws -> (records: [String: DownloadRecord], states: [String: DownloadState], jobs: [String: DownloadJobRecord]) {
         guard fileManager.fileExists(atPath: manifestURL.path) else {
-            return ([:], [:])
+            return ([:], [:], [:])
         }
 
         let data = try Data(contentsOf: manifestURL)
         let decoder = JSONDecoder()
-        let loadedRecords = try decoder.decode([DownloadRecord].self, from: data)
+        let decodedManifest: DownloadManifest
+        if let manifest = try? decoder.decode(DownloadManifest.self, from: data) {
+            decodedManifest = manifest
+        } else {
+            // Backward compatibility with older manifest shape.
+            let loadedRecords = try decoder.decode([DownloadRecord].self, from: data)
+            decodedManifest = DownloadManifest(version: 1, records: loadedRecords, jobs: [])
+        }
 
         var records: [String: DownloadRecord] = [:]
         var states: [String: DownloadState] = [:]
+        var jobs: [String: DownloadJobRecord] = [:]
 
-        for record in loadedRecords {
+        for record in decodedManifest.records {
             let localURL = downloadsDirectory.appendingPathComponent(record.localFileName)
             if fileManager.fileExists(atPath: localURL.path) {
                 records[record.itemID] = record
@@ -368,13 +529,60 @@ public actor DownloadManager {
             }
         }
 
-        return (records, states)
+        for job in decodedManifest.jobs {
+            guard records[job.itemID] == nil else { continue }
+            let normalizedState: DownloadJobState = (job.state == .downloading) ? .restarted : job.state
+            jobs[job.itemID] = DownloadJobRecord(
+                itemID: job.itemID,
+                itemTitle: job.itemTitle,
+                itemAuthor: job.itemAuthor,
+                state: normalizedState,
+                lastKnownProgress: job.lastKnownProgress,
+                updatedAt: job.updatedAt
+            )
+            states[job.itemID] = .notDownloaded
+        }
+
+        return (records, states, jobs)
     }
 
     private func persistManifest() throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(Array(records.values))
+        let manifest = DownloadManifest(
+            version: 2,
+            records: Array(records.values),
+            jobs: Array(jobs.values)
+        )
+        let data = try encoder.encode(manifest)
         try data.write(to: manifestURL, options: [.atomic])
+    }
+
+    private func transitionJob(
+        itemID: String,
+        title: String?,
+        author: String?,
+        state: DownloadJobState,
+        progress: Double? = nil
+    ) throws {
+        let existing = jobs[itemID]
+        let clampedProgress = min(max(progress ?? existing?.lastKnownProgress ?? 0, 0), 1)
+        if let existing,
+           existing.state == state,
+           abs(existing.lastKnownProgress - clampedProgress) < 0.02,
+           state == .downloading {
+            return
+        }
+
+        let updated = DownloadJobRecord(
+            itemID: itemID,
+            itemTitle: title ?? existing?.itemTitle,
+            itemAuthor: author ?? existing?.itemAuthor,
+            state: state,
+            lastKnownProgress: clampedProgress,
+            updatedAt: Date()
+        )
+        jobs[itemID] = updated
+        try persistManifest()
     }
 }

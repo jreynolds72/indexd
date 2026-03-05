@@ -46,6 +46,72 @@ final class ABSAPIClientTests: XCTestCase {
 
         XCTAssertEqual(result.map(\.title), ["Swift Patterns"])
     }
+
+    func testProbeRecommendsWebSocketWhenSocketEndpointExists() async throws {
+        let baseURL = URL(string: "https://example.com")!
+        let responses = [
+            MockHTTPClient.Response(
+                statusCode: 200,
+                data: Data("{\"token\":\"token-value\",\"expiresIn\":3600}".utf8)
+            ),
+            MockHTTPClient.Response(statusCode: 400, data: Data()),
+            MockHTTPClient.Response(statusCode: 404, data: Data())
+        ]
+
+        let http = MockHTTPClient(responses: responses)
+        let api = try await ABSAPIClient(baseURL: baseURL, httpClient: http, secureStore: InMemorySecureStore())
+
+        try await api.signIn(username: "user", password: "pass")
+        let probe = await api.probeLiveTransportSupport()
+
+        XCTAssertEqual(probe.recommended, .webSocket)
+        XCTAssertEqual(probe.candidates.count, 2)
+        XCTAssertEqual(probe.candidates.first(where: { $0.kind == .webSocket })?.statusCode, 400)
+        XCTAssertEqual(probe.candidates.first(where: { $0.kind == .webSocket })?.isAvailable, true)
+    }
+
+    func testProbeRecommendsSSEWhenWebSocketUnavailable() async throws {
+        let baseURL = URL(string: "https://example.com")!
+        let responses = [
+            MockHTTPClient.Response(
+                statusCode: 200,
+                data: Data("{\"token\":\"token-value\",\"expiresIn\":3600}".utf8)
+            ),
+            MockHTTPClient.Response(statusCode: 404, data: Data()),
+            MockHTTPClient.Response(statusCode: 200, data: Data())
+        ]
+
+        let http = MockHTTPClient(responses: responses)
+        let api = try await ABSAPIClient(baseURL: baseURL, httpClient: http, secureStore: InMemorySecureStore())
+
+        try await api.signIn(username: "user", password: "pass")
+        let probe = await api.probeLiveTransportSupport()
+
+        XCTAssertEqual(probe.recommended, .serverSentEvents)
+        XCTAssertEqual(probe.candidates.first(where: { $0.kind == .webSocket })?.isAvailable, false)
+        XCTAssertEqual(probe.candidates.first(where: { $0.kind == .serverSentEvents })?.isAvailable, true)
+    }
+
+    func testProbeFallsBackToPollingWhenNoRealtimeEndpointDetected() async throws {
+        let baseURL = URL(string: "https://example.com")!
+        let responses = [
+            MockHTTPClient.Response(
+                statusCode: 200,
+                data: Data("{\"token\":\"token-value\",\"expiresIn\":3600}".utf8)
+            ),
+            MockHTTPClient.Response(statusCode: 404, data: Data()),
+            MockHTTPClient.Response(statusCode: 404, data: Data())
+        ]
+
+        let http = MockHTTPClient(responses: responses)
+        let api = try await ABSAPIClient(baseURL: baseURL, httpClient: http, secureStore: InMemorySecureStore())
+
+        try await api.signIn(username: "user", password: "pass")
+        let probe = await api.probeLiveTransportSupport()
+
+        XCTAssertEqual(probe.recommended, .polling)
+        XCTAssertTrue(probe.candidates.allSatisfy { !$0.isAvailable })
+    }
 }
 
 private actor MockHTTPClient: HTTPClient {

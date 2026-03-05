@@ -58,6 +58,25 @@ final class DownloadManagerTests: XCTestCase {
         XCTAssertEqual(playbackAfterDelete, remoteURL)
     }
 
+    func testRecoverInterruptedJobsMarksQueuedAsRecovered() async throws {
+        let root = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let manager = try DownloadManager(storageDirectory: root, transport: MockDownloadTransport(payload: Data()))
+        try await manager.queueDownloadJob(
+            itemID: "book-queued",
+            itemTitle: "Queued Book",
+            itemAuthor: "Queued Author"
+        )
+
+        let restarted = try DownloadManager(storageDirectory: root, transport: MockDownloadTransport(payload: Data()))
+        let recovered = try await restarted.recoverInterruptedJobs()
+
+        XCTAssertEqual(recovered.count, 1)
+        XCTAssertEqual(recovered.first?.itemID, "book-queued")
+        XCTAssertEqual(recovered.first?.state, .recovered)
+    }
+
     private func makeTempDirectory() -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("abs-download-tests-\(UUID().uuidString)", isDirectory: true)

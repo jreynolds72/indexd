@@ -187,6 +187,62 @@ public actor ABSAPIClient {
         try await authenticatedGET(path: "api/items/\(itemID)/cover")
     }
 
+    public func probeLiveTransportSupport() async -> LiveTransportProbeResult {
+        let token = try? await authSession.accessToken()
+
+        let webSocketConnectURL = websocketConnectURL()
+        let webSocketProbeURL = socketIOPollingProbeURL()
+        let sseConnectURL = baseURL.appending(path: "api/events")
+        let sseProbeURL = sseConnectURL
+
+        let webSocketCandidate = await probeTransportCandidate(
+            kind: .webSocket,
+            connectURL: webSocketConnectURL,
+            probeURL: webSocketProbeURL,
+            bearerToken: token
+        )
+        let sseCandidate = await probeTransportCandidate(
+            kind: .serverSentEvents,
+            connectURL: sseConnectURL,
+            probeURL: sseProbeURL,
+            bearerToken: token
+        )
+
+        let candidates = [webSocketCandidate, sseCandidate]
+        let recommended: LiveTransportKind
+        if webSocketCandidate.isAvailable {
+            recommended = .webSocket
+        } else if sseCandidate.isAvailable {
+            recommended = .serverSentEvents
+        } else {
+            recommended = .polling
+        }
+
+        return LiveTransportProbeResult(
+            recommended: recommended,
+            candidates: candidates,
+            probedAt: Date()
+        )
+    }
+
+    public func liveUpdateEvents(preferred: LiveTransportKind? = nil) async -> AsyncThrowingStream<Void, Error>? {
+        let probe = await probeLiveTransportSupport()
+        let recommended = preferred ?? probe.recommended
+        guard recommended != .polling else { return nil }
+
+        let token = (try? await authSession.accessToken()) ?? ""
+        guard !token.isEmpty else { return nil }
+
+        switch recommended {
+        case .serverSentEvents:
+            return sseEventStream(token: token)
+        case .webSocket:
+            return webSocketEventStream(token: token)
+        case .polling:
+            return nil
+        }
+    }
+
     public func fetchProgress(itemID: String) async throws -> PlaybackProgress? {
         do {
             let data = try await authenticatedGET(path: "api/me/progress/\(itemID)")
@@ -215,7 +271,12 @@ public actor ABSAPIClient {
         }
     }
 
-    public func pushProgress(itemID: String, positionSeconds: TimeInterval, durationSeconds: TimeInterval?) async throws -> PlaybackProgress {
+    public func pushProgress(
+        itemID: String,
+        positionSeconds: TimeInterval,
+        durationSeconds: TimeInterval?,
+        isFinishedOverride: Bool? = nil
+    ) async throws -> PlaybackProgress {
         struct ProgressUpdateBody: Encodable {
             let currentTime: TimeInterval
             let duration: TimeInterval?
@@ -240,7 +301,7 @@ public actor ABSAPIClient {
                 currentTime: safePosition,
                 duration: safeDuration,
                 progress: ratio,
-                isFinished: (safeDuration.map { safePosition >= max(1, $0 - 1) }) ?? false
+                isFinished: isFinishedOverride ?? ((safeDuration.map { safePosition >= max(1, $0 - 1) }) ?? false)
             )
         )
 
@@ -250,6 +311,7 @@ public actor ABSAPIClient {
                 itemID: itemID,
                 positionSeconds: safePosition,
                 durationSeconds: safeDuration,
+                isFinished: isFinishedOverride ?? false,
                 updatedAt: Date()
             )
         }
@@ -273,6 +335,7 @@ public actor ABSAPIClient {
             itemID: itemID,
             positionSeconds: safePosition,
             durationSeconds: safeDuration,
+            isFinished: isFinishedOverride ?? false,
             updatedAt: Date()
         )
     }
@@ -421,6 +484,212 @@ public actor ABSAPIClient {
         }
         return text
     }
+
+    private func websocketConnectURL() -> URL {
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        components?.scheme = baseURL.scheme == "https" ? "wss" : "ws"
+        components?.path = "/socket.io/"
+        components?.queryItems = [
+            URLQueryItem(name: "EIO", value: "4"),
+            URLQueryItem(name: "transport", value: "websocket")
+        ]
+        return components?.url ?? baseURL
+    }
+
+    private func socketIOPollingProbeURL() -> URL {
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        components?.path = "/socket.io/"
+        components?.queryItems = [
+            URLQueryItem(name: "EIO", value: "4"),
+            URLQueryItem(name: "transport", value: "polling")
+        ]
+        return components?.url ?? baseURL
+    }
+
+    private func probeTransportCandidate(
+        kind: LiveTransportKind,
+        connectURL: URL,
+        probeURL: URL,
+        bearerToken: String?
+    ) async -> LiveTransportCandidate {
+        var request = URLRequest(url: probeURL)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 5
+        if let bearerToken, !bearerToken.isEmpty {
+            request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+        }
+
+        do {
+            let (_, response) = try await httpClient.send(request)
+            let status = response.statusCode
+            let available = isTransportEndpointAvailable(kind: kind, statusCode: status)
+            let note = transportProbeNote(kind: kind, statusCode: status, errorDescription: nil)
+            return LiveTransportCandidate(
+                kind: kind,
+                connectURL: connectURL,
+                probeURL: probeURL,
+                statusCode: status,
+                isAvailable: available,
+                note: note
+            )
+        } catch {
+            let note = transportProbeNote(kind: kind, statusCode: nil, errorDescription: String(describing: error))
+            return LiveTransportCandidate(
+                kind: kind,
+                connectURL: connectURL,
+                probeURL: probeURL,
+                statusCode: nil,
+                isAvailable: false,
+                note: note
+            )
+        }
+    }
+
+    private func isTransportEndpointAvailable(kind: LiveTransportKind, statusCode: Int) -> Bool {
+        if statusCode == 404 {
+            return false
+        }
+
+        if (200..<300).contains(statusCode) || statusCode == 101 || statusCode == 401 || statusCode == 403 {
+            return true
+        }
+
+        if kind == .webSocket, statusCode == 400 || statusCode == 426 {
+            // Socket endpoint likely exists; HTTP probing can fail without WS upgrade headers.
+            return true
+        }
+
+        return false
+    }
+
+    private func transportProbeNote(kind: LiveTransportKind, statusCode: Int?, errorDescription: String?) -> String? {
+        if let statusCode {
+            if statusCode == 404 {
+                return "Endpoint not found"
+            }
+            if kind == .webSocket, statusCode == 400 || statusCode == 426 {
+                return "Endpoint present; websocket upgrade required"
+            }
+            return "HTTP \(statusCode)"
+        }
+        if let errorDescription, !errorDescription.isEmpty {
+            return errorDescription
+        }
+        return nil
+    }
+
+    private func sseEventStream(token: String) -> AsyncThrowingStream<Void, Error> {
+        AsyncThrowingStream { continuation in
+            let session = URLSession(configuration: .ephemeral)
+            let task = Task {
+                var reconnectDelaySeconds: UInt64 = 1
+
+                while !Task.isCancelled {
+                    do {
+                        var request = URLRequest(url: baseURL.appending(path: "api/events"))
+                        request.httpMethod = "GET"
+                        request.timeoutInterval = 60
+                        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+                        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+                        let (bytes, response) = try await session.bytes(for: request)
+                        guard let http = response as? HTTPURLResponse else {
+                            throw APIError.invalidResponse
+                        }
+                        guard (200..<300).contains(http.statusCode) else {
+                            throw APIError.requestFailed(statusCode: http.statusCode)
+                        }
+
+                        reconnectDelaySeconds = 1
+                        for try await line in bytes.lines {
+                            if Task.isCancelled { break }
+                            if line.hasPrefix("data:") || line.hasPrefix("event:") {
+                                continuation.yield(())
+                            }
+                        }
+                    } catch {
+                        if Task.isCancelled { break }
+                        try? await Task.sleep(nanoseconds: reconnectDelaySeconds * 1_000_000_000)
+                        reconnectDelaySeconds = min(reconnectDelaySeconds * 2, 15)
+                    }
+                }
+
+                continuation.finish()
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+                session.invalidateAndCancel()
+            }
+        }
+    }
+
+    private func webSocketEventStream(token: String) -> AsyncThrowingStream<Void, Error> {
+        AsyncThrowingStream { continuation in
+            let session = URLSession(configuration: .ephemeral)
+            let task = Task {
+                var reconnectDelaySeconds: UInt64 = 1
+
+                while !Task.isCancelled {
+                    var connectURL = websocketConnectURL()
+                    if var components = URLComponents(url: connectURL, resolvingAgainstBaseURL: false) {
+                        var items = components.queryItems ?? []
+                        items.append(URLQueryItem(name: "token", value: token))
+                        components.queryItems = items
+                        connectURL = components.url ?? connectURL
+                    }
+
+                    let socketTask = session.webSocketTask(with: connectURL)
+                    socketTask.resume()
+
+                    // socket.io namespace connect frame
+                    try? await socketTask.send(.string("40"))
+
+                    do {
+                        reconnectDelaySeconds = 1
+                        while !Task.isCancelled {
+                            let message = try await socketTask.receive()
+                            let text: String
+                            switch message {
+                            case .string(let payload):
+                                text = payload
+                            case .data(let payload):
+                                text = String(decoding: payload, as: UTF8.self)
+                            @unknown default:
+                                text = ""
+                            }
+
+                            if text == "2" {
+                                // socket.io heartbeat pong
+                                try? await socketTask.send(.string("3"))
+                                continue
+                            }
+
+                            if text.hasPrefix("42") || text.hasPrefix("40") || text.hasPrefix("43") {
+                                continuation.yield(())
+                            }
+                        }
+                    } catch {
+                        socketTask.cancel(with: .goingAway, reason: nil)
+                        if Task.isCancelled { break }
+                        try? await Task.sleep(nanoseconds: reconnectDelaySeconds * 1_000_000_000)
+                        reconnectDelaySeconds = min(reconnectDelaySeconds * 2, 15)
+                        continue
+                    }
+
+                    socketTask.cancel(with: .goingAway, reason: nil)
+                }
+
+                continuation.finish()
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+                session.invalidateAndCancel()
+            }
+        }
+    }
 }
 
 private struct LibraryDTO: Decodable {
@@ -467,6 +736,7 @@ private struct MediaProgressDTO: Decodable {
     let currentTime: TimeInterval?
     let duration: TimeInterval?
     let progress: Double?
+    let isFinished: Bool?
     let lastUpdate: Double?
     let updatedAt: Date?
 
@@ -493,6 +763,7 @@ private struct MediaProgressDTO: Decodable {
             itemID: itemID,
             positionSeconds: position,
             durationSeconds: duration,
+            isFinished: isFinished,
             updatedAt: timestamp
         )
     }

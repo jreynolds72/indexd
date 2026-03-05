@@ -6,6 +6,38 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.1.0-beta.4] - 2026-03-04
+
+### Added
+- Played/Unplayed state management wired to ABS native finished status:
+  - Single-item and multi-select actions for Mark Played / Mark Unplayed.
+  - Played status surface in rows and detail panel metadata.
+- Live transport diagnostics and behavior improvements:
+  - Transport probing and recommendation (WebSocket/SSE/Polling fallback).
+  - Connected menu now shows active transport.
+  - Background selected-item reconciliation while live transport is active.
+- Settings maintenance capabilities:
+  - New Maintenance tab with guided uninstall workflow.
+  - Uninstall summary sheet with staged cleanup actions and optional cached-book export.
+- Download UX enhancements:
+  - Sequential queue recovery behavior for interrupted jobs.
+  - Download popout improvements (resizable panel, scroll-first item listing, item click-through).
+  - Bulk download/remove actions integrated into multi-select workflows.
+- Dock icon shortcuts:
+  - Library/navigation quick actions and playback controls from dock menu.
+
+### Changed
+- Search/list refresh behavior no longer flashes to unfiltered state during live update ticks.
+- Selection normalization moved to avoid NSTableView reentrant delegate warnings.
+- Detail metadata panel expanded with richer fields and cleaner structured rendering.
+- Download actions in book detail panel simplified to compact button-style controls.
+
+### Fixed
+- Prevented local selected-item sync paths from overwriting ABS played/unplayed changes.
+- Resolved repeated 15-second UI reversion issue while searching.
+- Fixed now playing/widget art propagation reliability in media integration path.
+- Fixed download compatibility on servers missing specific audio file identifier fields.
+
 ## [0.1.0-beta.3] - 2026-03-03
 
 ### Added

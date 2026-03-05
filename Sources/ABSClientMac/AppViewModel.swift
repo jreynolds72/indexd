@@ -24,6 +24,7 @@ final class AppViewModel: ObservableObject {
     @Published var errorMessage: String?
     @Published private(set) var isProgressSyncing = false
     @Published private(set) var lastProgressSyncAt: Date?
+    @Published private(set) var liveTransportProbe: LiveTransportProbeResult?
 
     @Published var libraries: [ABSCore.Library] = []
     @Published var selectedLibraryID: String?
@@ -85,12 +86,14 @@ final class AppViewModel: ObservableObject {
 
             apiClient = client
             try await configureSyncEngine()
+            await updateLiveTransportProbe(using: client)
             isAuthenticated = true
             defaults.set(url.absoluteString, forKey: serverDefaultsKey)
 
             try await reloadLibraries()
         } catch {
             isAuthenticated = false
+            liveTransportProbe = nil
             errorMessage = "Connection failed: \(describe(error))"
         }
     }
@@ -109,6 +112,17 @@ final class AppViewModel: ObservableObject {
             try await loadItems(for: selectedLibraryID)
         } else {
             displayedItems = []
+        }
+    }
+
+    func refreshLibrariesMetadataOnly() async throws {
+        guard let apiClient else { return }
+
+        let loaded = try await apiClient.libraries()
+        libraries = loaded
+
+        if selectedLibraryID == nil || !loaded.contains(where: { $0.id == selectedLibraryID }) {
+            selectedLibraryID = loaded.first?.id
         }
     }
 
@@ -153,6 +167,39 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    func liveRefreshCurrentContext(searchQuery: String) async {
+        guard let apiClient else { return }
+        guard let libraryID = selectedLibraryID else { return }
+
+        do {
+            let freshItems = try await apiClient.items(in: libraryID)
+            itemsByLibrary[libraryID] = freshItems
+
+            let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            if query.isEmpty {
+                displayedItems = freshItems
+                return
+            }
+
+            do {
+                let results = try await apiClient.search(query: query, in: libraryID)
+                displayedItems = mergeSearchResultsPreservingKnownFields(results, baseItems: freshItems)
+            } catch {
+                if case APIError.requestFailed(statusCode: 404) = error {
+                    displayedItems = freshItems.filter { item in
+                        item.title.localizedCaseInsensitiveContains(query)
+                            || (item.author?.localizedCaseInsensitiveContains(query) ?? false)
+                    }
+                } else {
+                    // Preserve currently visible results on transient search failures.
+                    errorMessage = "Search failed: \(describe(error))"
+                }
+            }
+        } catch {
+            errorMessage = "Failed loading items: \(describe(error))"
+        }
+    }
+
     func refreshDetailsForSelectedItem(itemID: String?) async {
         guard let itemID, let apiClient else { return }
 
@@ -162,6 +209,11 @@ final class AppViewModel: ObservableObject {
         } catch {
             // Keep existing list item if details request fails.
         }
+    }
+
+    func liveUpdateEvents() async -> AsyncThrowingStream<Void, Error>? {
+        guard isAuthenticated, let apiClient else { return nil }
+        return await apiClient.liveUpdateEvents(preferred: liveTransportProbe?.recommended)
     }
 
     func streamURL(for itemID: String) async throws -> URL {
@@ -193,6 +245,28 @@ final class AppViewModel: ObservableObject {
         return Set(await downloadManager.allDownloads().map(\.itemID))
     }
 
+    func queueDownloadJob(itemID: String) async {
+        guard let downloadManager else { return }
+        let itemMetadata = item(withID: itemID)
+        let itemTitle = itemMetadata?.title
+        let itemAuthor = itemMetadata?.authors.joined(separator: ", ")
+        try? await downloadManager.queueDownloadJob(
+            itemID: itemID,
+            itemTitle: itemTitle,
+            itemAuthor: itemAuthor
+        )
+    }
+
+    func recoverPendingDownloadJobs() async -> [DownloadJobRecord] {
+        guard let downloadManager else { return [] }
+        return (try? await downloadManager.recoverInterruptedJobs()) ?? []
+    }
+
+    func pendingDownloadJobs() async -> [DownloadJobRecord] {
+        guard let downloadManager else { return [] }
+        return await downloadManager.pendingDownloadJobs()
+    }
+
     @discardableResult
     func downloadItem(
         itemID: String,
@@ -202,11 +276,16 @@ final class AppViewModel: ObservableObject {
             throw DownloadFeatureError.unavailable
         }
         let remoteURL = try await streamURL(for: itemID)
-        let preferredFileName = item(withID: itemID)?.title
+        let itemMetadata = item(withID: itemID)
+        let preferredFileName = itemMetadata?.title
+        let itemTitle = itemMetadata?.title
+        let itemAuthor = itemMetadata?.authors.joined(separator: ", ")
         return try await downloadManager.download(
             itemID: itemID,
             from: remoteURL,
             preferredFileName: preferredFileName,
+            itemTitle: itemTitle,
+            itemAuthor: itemAuthor,
             progress: progress
         )
     }
@@ -316,6 +395,7 @@ final class AppViewModel: ObservableObject {
         displayedItems = []
         itemsByLibrary = [:]
         coverDataByItemID = [:]
+        liveTransportProbe = nil
         password = ""
         defaults.removeObject(forKey: serverDefaultsKey)
     }
@@ -327,6 +407,12 @@ final class AppViewModel: ObservableObject {
 
     var currentLibraryItems: [ABSCore.LibraryItem] {
         itemsByLibrary[selectedLibraryID ?? ""] ?? displayedItems
+    }
+
+    func allKnownItems() -> [ABSCore.LibraryItem] {
+        let flattened = itemsByLibrary.values.flatMap { $0 } + displayedItems
+        let deduped = Dictionary(grouping: flattened, by: \.id).compactMap { $0.value.first }
+        return deduped
     }
 
     func describeError(_ error: Error) -> String {
@@ -457,6 +543,59 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    func setPlayedState(
+        itemID: String,
+        isPlayed: Bool,
+        durationSeconds: TimeInterval?,
+        currentPositionSeconds: TimeInterval
+    ) async -> PlaybackProgress? {
+        guard let apiClient else { return nil }
+
+        let safeCurrent = max(0, currentPositionSeconds)
+        let safeDuration = (durationSeconds ?? 0) > 0 ? durationSeconds : nil
+        let targetPosition: TimeInterval = {
+            if isPlayed {
+                if let safeDuration {
+                    return max(safeCurrent, safeDuration)
+                }
+                return max(safeCurrent, 1)
+            }
+            return 0
+        }()
+
+        do {
+            beginSyncOperation()
+            defer { endSyncOperation() }
+
+            let pushed = try await apiClient.pushProgress(
+                itemID: itemID,
+                positionSeconds: targetPosition,
+                durationSeconds: safeDuration,
+                isFinishedOverride: isPlayed
+            )
+
+            if let syncEngine {
+                _ = try await syncEngine.recordProgress(
+                    itemID: itemID,
+                    positionSeconds: pushed.positionSeconds,
+                    durationSeconds: pushed.durationSeconds ?? safeDuration,
+                    trigger: .manual
+                )
+                _ = try await syncEngine.sync(itemID: itemID, conflictResolver: { _ in .useLocal })
+            }
+
+            lastProgressSyncAt = Date()
+            return pushed
+        } catch {
+            return nil
+        }
+    }
+
+    func fetchProgress(itemID: String) async throws -> PlaybackProgress? {
+        guard let apiClient else { return nil }
+        return try await apiClient.fetchProgress(itemID: itemID)
+    }
+
     private func loadItems(for libraryID: String) async throws {
         guard let apiClient else { return }
 
@@ -569,6 +708,7 @@ final class AppViewModel: ObservableObject {
             let client = try await ABSAPIClient(baseURL: url, secureStore: secureStore)
             apiClient = client
             try await configureSyncEngine()
+            await updateLiveTransportProbe(using: client)
 
             if await client.hasPersistedLogin() {
                 isAuthenticated = true
@@ -576,6 +716,7 @@ final class AppViewModel: ObservableObject {
             }
         } catch {
             isAuthenticated = false
+            liveTransportProbe = nil
         }
     }
 
@@ -590,6 +731,10 @@ final class AppViewModel: ObservableObject {
             connectivity: AlwaysOnlineConnectivity(),
             configuration: SyncConfiguration(periodicUpdateInterval: 15, conflictThreshold: 30)
         )
+    }
+
+    private func updateLiveTransportProbe(using client: ABSAPIClient) async {
+        liveTransportProbe = await client.probeLiveTransportSupport()
     }
 
     private nonisolated static func resolveConflict(_ conflict: SyncConflict) -> SyncConflictResolution {
