@@ -4,8 +4,21 @@ import ABSCore
 
 struct PreferencesView: View {
     @EnvironmentObject private var preferences: AppPreferences
+    private let localLibraryManager = LocalLibraryManager()
+    private let metadataMatcher = OpenLibraryMetadataMatcher()
     @State private var captureTarget: CaptureTarget?
     @State private var keyCaptureMonitor: Any?
+    @State private var localLibraryRoots: [LocalLibraryRoot] = []
+    @State private var localLibraryBookCounts: [String: Int] = [:]
+    @State private var localLibraryLoading = false
+    @State private var localLibraryRescanInProgress = false
+    @State private var localLibraryErrorMessage: String?
+    @State private var metadataMatchingRoot: LocalLibraryRoot?
+    @State private var showMetadataMatchOptIn = false
+    @State private var showMetadataMatchReview = false
+    @State private var metadataMatchInProgress = false
+    @State private var metadataApplyInProgress = false
+    @State private var metadataReviewItems: [MetadataReviewItem] = []
     @State private var showUninstallSummarySheet = false
     @State private var uninstallInProgress = false
     @State private var uninstallErrorMessage: String?
@@ -38,6 +51,18 @@ struct PreferencesView: View {
         let title: String
         let author: String
         var selected: Bool
+    }
+
+    private struct MetadataReviewItem: Identifiable {
+        let id: String
+        let localItem: ABSCore.LibraryItem
+        let candidates: [MetadataMatchCandidate]
+        var selectedCandidateID: String
+        var apply: Bool
+
+        var selectedCandidate: MetadataMatchCandidate? {
+            candidates.first(where: { $0.id == selectedCandidateID }) ?? candidates.first
+        }
     }
 
     private enum UninstallCleanupAction: String, CaseIterable, Identifiable {
@@ -77,6 +102,12 @@ struct PreferencesView: View {
                 .tag(SettingsTab.shortcuts)
                 .tabItem {
                     Label("Shortcuts", systemImage: "keyboard")
+                }
+
+            localLibraryTab
+                .tag(SettingsTab.localLibrary)
+                .tabItem {
+                    Label("Local Library", systemImage: "externaldrive")
                 }
 
             maintenanceTab
@@ -122,6 +153,113 @@ struct PreferencesView: View {
         .formStyle(.grouped)
     }
 
+    private var localLibraryTab: some View {
+        Form {
+            Section("Summary") {
+                if localLibraryLoading {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading local library summary…")
+                            .foregroundStyle(.secondary)
+                    }
+                } else if localLibraryRoots.isEmpty {
+                    Text("No local libraries configured.")
+                        .foregroundStyle(.secondary)
+                } else if metadataMatchInProgress {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Matching metadata online…")
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    LabeledContent("Local Library Roots") {
+                        Text("\(localLibraryRoots.count)")
+                    }
+                    LabeledContent("Total Books") {
+                        Text("\(localLibraryBookCounts.values.reduce(0, +))")
+                    }
+                }
+
+                HStack {
+                    Spacer()
+                    Button("Scan for New Books") {
+                        rescanLocalLibraries()
+                    }
+                    .disabled(localLibraryLoading || localLibraryRescanInProgress || localLibraryRoots.isEmpty)
+                }
+            }
+
+            Section("Roots") {
+                if localLibraryRoots.isEmpty, !localLibraryLoading {
+                    Text("Add a local library from the main app to manage it here.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(localLibraryRoots) { root in
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(root.name)
+                                    .font(.headline)
+                                Spacer()
+                                Text("\(localLibraryBookCounts[root.id, default: 0]) books")
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Text(root.directoryURL.path)
+                                .font(.caption)
+                                .textSelection(.enabled)
+                                .foregroundStyle(.secondary)
+
+                            HStack(spacing: 8) {
+                                Button("Open Root Folder") {
+                                    NSWorkspace.shared.open(root.directoryURL)
+                                }
+
+                                Button("Scan Root") {
+                                    rescanLocalLibraryRoot(id: root.id)
+                                }
+                                .disabled(localLibraryLoading || localLibraryRescanInProgress)
+
+                                Button("Match Metadata") {
+                                    metadataMatchingRoot = root
+                                    showMetadataMatchOptIn = true
+                                }
+                                .disabled(localLibraryLoading || localLibraryRescanInProgress || metadataMatchInProgress)
+                                .help("Find metadata matches from OpenLibrary. You review confidence and approve before apply.")
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .task {
+            await refreshLocalLibrarySummary()
+        }
+        .alert("Local Library Error", isPresented: localLibraryErrorBinding) {
+            Button("OK", role: .cancel) {
+                localLibraryErrorMessage = nil
+            }
+        } message: {
+            Text(localLibraryErrorMessage ?? "Unknown error")
+        }
+        .confirmationDialog("Match Metadata", isPresented: $showMetadataMatchOptIn, titleVisibility: .visible) {
+            Button("Continue") {
+                startMetadataMatchReview()
+            }
+            Button("Cancel", role: .cancel) {
+                metadataMatchingRoot = nil
+            }
+        } message: {
+            Text("Metadata matching uses OpenLibrary search queries. Matches are scored and require your review before any changes are applied.")
+        }
+        .sheet(isPresented: $showMetadataMatchReview) {
+            metadataMatchReviewSheet
+        }
+    }
+
     private var maintenanceTab: some View {
         Form {
             Section {
@@ -160,6 +298,95 @@ struct PreferencesView: View {
         .sheet(isPresented: $showUninstallProgressSheet) {
             uninstallProgressSheet
         }
+    }
+
+    private var metadataMatchReviewSheet: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Metadata Review")
+                        .font(.title3.bold())
+                    Text("Source: OpenLibrary • Non-destructive merge")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if metadataApplyInProgress {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            if metadataReviewItems.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.title2)
+                        .foregroundStyle(.secondary)
+                    Text("No Candidates")
+                        .font(.headline)
+                    Text("No confident metadata matches were found.")
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List {
+                    ForEach($metadataReviewItems) { $review in
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(alignment: .firstTextBaseline) {
+                                Toggle(isOn: $review.apply) {
+                                    Text(review.localItem.title)
+                                        .font(.headline)
+                                }
+                                Spacer()
+                                if let selected = review.selectedCandidate {
+                                    Text("\(Int((selected.confidence * 100).rounded()))%")
+                                        .monospacedDigit()
+                                        .foregroundStyle(selected.confidence >= 0.75 ? .green : .orange)
+                                }
+                            }
+
+                            Text(review.localItem.author ?? review.localItem.authors.joined(separator: ", "))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            Picker("Candidate", selection: $review.selectedCandidateID) {
+                                ForEach(review.candidates) { candidate in
+                                    Text("\(candidate.title) • \(Int((candidate.confidence * 100).rounded()))%")
+                                        .tag(candidate.id)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+
+                            if let selected = review.selectedCandidate {
+                                Text("\(selected.authors.joined(separator: ", ")) • \(selected.confidenceReason)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+                .listStyle(.inset)
+            }
+
+            Divider()
+
+            HStack {
+                Button("Cancel", role: .cancel) {
+                    showMetadataMatchReview = false
+                    metadataReviewItems = []
+                    metadataMatchingRoot = nil
+                }
+                Spacer()
+                Button("Apply Selected") {
+                    applyMetadataMatches()
+                }
+                .disabled(metadataApplyInProgress || metadataReviewItems.allSatisfy { !$0.apply || $0.selectedCandidate == nil })
+            }
+        }
+        .padding(16)
+        .frame(minWidth: 760, minHeight: 460)
     }
 
     private var uninstallSummarySheet: some View {
@@ -532,6 +759,17 @@ struct PreferencesView: View {
         )
     }
 
+    private var localLibraryErrorBinding: Binding<Bool> {
+        Binding(
+            get: { localLibraryErrorMessage != nil },
+            set: { visible in
+                if !visible {
+                    localLibraryErrorMessage = nil
+                }
+            }
+        )
+    }
+
     private var selectedCachedDownloadIDs: Set<String> {
         Set(cachedDownloads.filter(\.selected).map(\.id))
     }
@@ -623,5 +861,127 @@ struct PreferencesView: View {
         let response = panel.runModal()
         guard response == .OK else { return nil }
         return panel.url
+    }
+
+    private func refreshLocalLibrarySummary() async {
+        localLibraryLoading = true
+        defer { localLibraryLoading = false }
+
+        let snapshot = await localLibraryManager.snapshot()
+        localLibraryRoots = snapshot.roots
+        localLibraryBookCounts = Dictionary(
+            uniqueKeysWithValues: snapshot.roots.map { root in
+                let libraryID = LocalLibraryManager.libraryIDPrefix + root.id
+                return (root.id, snapshot.itemsByLibrary[libraryID]?.count ?? 0)
+            }
+        )
+    }
+
+    private func startMetadataMatchReview() {
+        guard !metadataMatchInProgress, let root = metadataMatchingRoot else { return }
+        metadataMatchInProgress = true
+        metadataReviewItems = []
+
+        Task {
+            do {
+                let items = await localLibraryManager.items(inRoot: root.id)
+                var reviewItems: [MetadataReviewItem] = []
+                reviewItems.reserveCapacity(items.count)
+
+                for item in items {
+                    let candidates = try await metadataMatcher.match(for: item, limit: 4)
+                    guard !candidates.isEmpty else { continue }
+                    let defaultCandidate = candidates.first!
+                    reviewItems.append(
+                        MetadataReviewItem(
+                            id: item.id,
+                            localItem: item,
+                            candidates: candidates,
+                            selectedCandidateID: defaultCandidate.id,
+                            apply: defaultCandidate.confidence >= 0.72
+                        )
+                    )
+                }
+
+                await MainActor.run {
+                    metadataMatchInProgress = false
+                    metadataReviewItems = reviewItems
+                    if reviewItems.isEmpty {
+                        localLibraryErrorMessage = "No confident metadata matches found for this root."
+                        metadataMatchingRoot = nil
+                    } else {
+                        showMetadataMatchReview = true
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    metadataMatchInProgress = false
+                    localLibraryErrorMessage = "Metadata match failed: \(error.localizedDescription)"
+                    metadataMatchingRoot = nil
+                }
+            }
+        }
+    }
+
+    private func applyMetadataMatches() {
+        guard !metadataApplyInProgress, let root = metadataMatchingRoot else { return }
+        metadataApplyInProgress = true
+
+        let selected = metadataReviewItems.compactMap { review -> (String, MetadataMatchCandidate)? in
+            guard review.apply, let candidate = review.selectedCandidate else { return nil }
+            return (review.localItem.id, candidate)
+        }
+
+        Task {
+            do {
+                for (itemID, candidate) in selected {
+                    _ = try await localLibraryManager.applyMetadataCandidate(
+                        rootID: root.id,
+                        itemID: itemID,
+                        candidate: candidate
+                    )
+                }
+                await refreshLocalLibrarySummary()
+                await MainActor.run {
+                    metadataApplyInProgress = false
+                    showMetadataMatchReview = false
+                    metadataReviewItems = []
+                    metadataMatchingRoot = nil
+                }
+            } catch {
+                await MainActor.run {
+                    metadataApplyInProgress = false
+                    localLibraryErrorMessage = "Failed applying metadata: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func rescanLocalLibraries() {
+        guard !localLibraryRescanInProgress else { return }
+        localLibraryRescanInProgress = true
+        Task {
+            do {
+                try await localLibraryManager.rescanAll()
+                await refreshLocalLibrarySummary()
+            } catch {
+                localLibraryErrorMessage = "Failed to scan local libraries: \(error.localizedDescription)"
+            }
+            localLibraryRescanInProgress = false
+        }
+    }
+
+    private func rescanLocalLibraryRoot(id: String) {
+        guard !localLibraryRescanInProgress else { return }
+        localLibraryRescanInProgress = true
+        Task {
+            do {
+                try await localLibraryManager.rescanRoot(id: id)
+                await refreshLocalLibrarySummary()
+            } catch {
+                localLibraryErrorMessage = "Failed to scan root: \(error.localizedDescription)"
+            }
+            localLibraryRescanInProgress = false
+        }
     }
 }

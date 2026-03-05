@@ -349,6 +349,7 @@ struct ContentView: View {
     @State private var downloadQueuedItemIDs: Set<String> = []
     @State private var downloadProgressByItemID: [String: Double] = [:]
     @State private var downloadRecoveredStateByItemID: [String: DownloadJobState] = [:]
+    @State private var copiedToLocalItemIDs: Set<String> = []
     @State private var isClearingDownloads = false
     @State private var downloadMenuPage = 0
     @State private var showingDownloadsPopover = false
@@ -411,6 +412,17 @@ struct ContentView: View {
                     Text("Transport: \(transportStatusDisplay)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    Divider()
+
+                    Button("Add Local Folder…") {
+                        addLocalLibraryFolder()
+                    }
+
+                    Button("Rescan Local Libraries") {
+                        rescanLocalLibraries()
+                    }
+                    .disabled(!viewModel.hasLocalLibraries)
 
                     Divider()
 
@@ -569,7 +581,7 @@ struct ContentView: View {
             loadLocalPlaybackMetadata()
             await refreshDownloadedInventory()
             await recoverPendingDownloadsIfNeeded()
-            showingServerSheet = !viewModel.isAuthenticated
+            showingServerSheet = !viewModel.isAuthenticated && !viewModel.hasAnyLibraries
             if viewModel.selectedLibraryID == nil {
                 viewModel.selectedLibraryID = viewModel.libraries.first?.id
             }
@@ -1167,6 +1179,12 @@ struct ContentView: View {
                         Task { await downloadItems(contextItemIDs) }
                     }
 
+                    if canCopyToLocalLibrary {
+                        Button("Copy Selected to Local Library (\(contextItemIDs.count))") {
+                            Task { await copyItemsToLocalLibrary(contextItemIDs) }
+                        }
+                    }
+
                     Button("Remove Downloaded Files (\(contextSelectedDownloadedItemIDs(for: item.id).count))", role: .destructive) {
                         Task { await removeDownloads(contextItemIDs) }
                     }
@@ -1250,6 +1268,12 @@ struct ContentView: View {
                             Button("Remove Downloaded File", role: .destructive) {
                                 Task { await removeDownload(for: item.id) }
                             }
+                        }
+                    }
+
+                    if canCopyToLocalLibrary {
+                        Button("Copy to Local Library") {
+                            Task { await copyItemsToLocalLibrary([item.id]) }
                         }
                     }
                 }
@@ -1367,6 +1391,14 @@ struct ContentView: View {
             }
             .padding(.vertical, 2)
             .tag(group.id)
+            .contextMenu {
+                let copyItemIDs = groupCopyItemIDs(for: group)
+                if canCopyToLocalLibrary, !copyItemIDs.isEmpty {
+                    Button(groupCopyActionLabel(itemCount: copyItemIDs.count)) {
+                        Task { await copyItemsToLocalLibrary(copyItemIDs) }
+                    }
+                }
+            }
         }
     }
 
@@ -1605,12 +1637,17 @@ struct ContentView: View {
                 Image(systemName: "book")
                     .font(.system(size: 28))
                     .foregroundStyle(.secondary)
-                Text(viewModel.isAuthenticated ? "Select an audiobook" : "Connect a server")
+                Text(viewModel.isAuthenticated || viewModel.hasAnyLibraries ? "Select an audiobook" : "Connect a server or add a local folder")
                     .font(.headline)
                     .foregroundStyle(.secondary)
-                if !viewModel.isAuthenticated {
-                    Button("Add Server") {
-                        showingServerSheet = true
+                if !viewModel.isAuthenticated && !viewModel.hasAnyLibraries {
+                    HStack(spacing: 12) {
+                        Button("Add Server") {
+                            showingServerSheet = true
+                        }
+                        Button("Add Local Folder…") {
+                            addLocalLibraryFolder()
+                        }
                     }
                 }
             }
@@ -2811,6 +2848,31 @@ struct ContentView: View {
         return ids.allSatisfy { favoriteItemIDs.contains($0) }
     }
 
+    private var canCopyToLocalLibrary: Bool {
+        viewModel.canCopyFromSelectedLibraryToLocal
+    }
+
+    private func groupCopyItemIDs(for group: BrowseGroup) -> [String] {
+        guard canCopyToLocalLibrary else { return [] }
+        switch currentBrowseTab {
+        case .authors, .series:
+            return Array(Set(group.items.map(\.id))).sorted()
+        default:
+            return []
+        }
+    }
+
+    private func groupCopyActionLabel(itemCount: Int) -> String {
+        switch currentBrowseTab {
+        case .authors:
+            return "Copy Author to Local Library (\(itemCount))"
+        case .series:
+            return "Copy Series to Local Library (\(itemCount))"
+        default:
+            return "Copy to Local Library (\(itemCount))"
+        }
+    }
+
     private func contextSelectionIDs(for rowItemID: String) -> [String] {
         if selectedItemIDs.count > 1, selectedItemIDs.contains(rowItemID) {
             return selectedVisibleItemIDs
@@ -2852,6 +2914,15 @@ struct ContentView: View {
                 Task { await downloadItems(ids) }
             }
             .disabled(selectedVisibleItemIDs.isEmpty)
+
+            if canCopyToLocalLibrary {
+                Button("Copy Selected to Local Library (\(selectedVisibleItemIDs.count))") {
+                    let ids = selectedVisibleItemIDs
+                    showingBulkActionsPopover = false
+                    Task { await copyItemsToLocalLibrary(ids) }
+                }
+                .disabled(selectedVisibleItemIDs.isEmpty)
+            }
 
             Button("Remove Downloaded Files (\(selectedDownloadedItemIDs.count))", role: .destructive) {
                 let ids = selectedVisibleItemIDs
@@ -3333,6 +3404,7 @@ struct ContentView: View {
             .union(downloadBusyItemIDs)
             .union(downloadQueuedItemIDs)
             .union(downloadRecoveredStateByItemID.keys)
+            .union(copiedToLocalItemIDs)
         return allIDs.sorted { lhs, rhs in
             let lhsBusy = downloadBusyItemIDs.contains(lhs)
             let rhsBusy = downloadBusyItemIDs.contains(rhs)
@@ -3439,6 +3511,10 @@ struct ContentView: View {
                                             .foregroundStyle(.secondary)
                                     } else if downloadQueuedItemIDs.contains(itemID) {
                                         Text("Queued")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    } else if copiedToLocalItemIDs.contains(itemID) {
+                                        Text("Copied to Local Library")
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                     } else {
@@ -3908,6 +3984,59 @@ struct ContentView: View {
                     selectedItemID = nil
                 }
                 updateNowPlaying()
+            }
+        }
+    }
+
+    private func addLocalLibraryFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "Add Folder"
+        panel.message = "Choose a folder containing audiobook files."
+
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+
+        Task {
+            do {
+                try await viewModel.addLocalLibraryRoot(directoryURL: url)
+                showingServerSheet = !viewModel.isAuthenticated && !viewModel.hasAnyLibraries
+                if viewModel.selectedLibraryID == nil {
+                    viewModel.selectedLibraryID = viewModel.libraries.first?.id
+                }
+                if let selectedLibraryID = viewModel.selectedLibraryID, browseTabByLibraryID[selectedLibraryID] == nil {
+                    browseTabByLibraryID[selectedLibraryID] = .books
+                }
+                if isBookListTab {
+                    selectedItemID = browsedItems.first?.id
+                    selectedGroupID = nil
+                } else {
+                    selectedGroupID = displayedBrowseGroups.first?.id
+                    selectedItemID = nil
+                }
+            } catch {
+                viewModel.setError("Failed to add local folder: \(viewModel.describeError(error))")
+            }
+        }
+    }
+
+    private func rescanLocalLibraries() {
+        Task {
+            do {
+                try await viewModel.rescanLocalLibraries()
+                if isBookListTab {
+                    selectedItemID = browsedItems.first?.id
+                    selectedGroupID = nil
+                } else {
+                    selectedGroupID = displayedBrowseGroups.first?.id
+                    selectedItemID = nil
+                }
+            } catch {
+                viewModel.setError("Failed to rescan local libraries: \(viewModel.describeError(error))")
             }
         }
     }
@@ -4442,6 +4571,7 @@ struct ContentView: View {
         await viewModel.queueDownloadJob(itemID: itemID)
         downloadQueuedItemIDs.remove(itemID)
         downloadRecoveredStateByItemID[itemID] = .downloading
+        copiedToLocalItemIDs.remove(itemID)
         downloadBusyItemIDs.insert(itemID)
         downloadProgressByItemID[itemID] = 0
         defer {
@@ -4524,6 +4654,7 @@ struct ContentView: View {
             downloadStateByItemID[itemID] = .notDownloaded
             downloadedItemIDs.remove(itemID)
             downloadRecoveredStateByItemID.removeValue(forKey: itemID)
+            copiedToLocalItemIDs.remove(itemID)
         } catch {
             viewModel.setError("Failed removing download: \(viewModel.describeError(error))")
         }
@@ -4540,6 +4671,7 @@ struct ContentView: View {
             downloadQueuedItemIDs.removeAll()
             downloadProgressByItemID.removeAll()
             downloadRecoveredStateByItemID.removeAll()
+            copiedToLocalItemIDs.removeAll()
             for itemID in downloadStateByItemID.keys {
                 downloadStateByItemID[itemID] = .notDownloaded
             }
@@ -4610,6 +4742,7 @@ struct ContentView: View {
         downloadQueuedItemIDs = []
         downloadProgressByItemID = [:]
         downloadRecoveredStateByItemID = [:]
+        copiedToLocalItemIDs = []
         isClearingDownloads = false
         hasAttemptedDownloadRecovery = false
         UserDefaults.standard.removeObject(forKey: progressDefaultsKey)
@@ -4765,6 +4898,79 @@ struct ContentView: View {
         }
         for itemID in ordered {
             await downloadItem(itemID)
+        }
+    }
+
+    private func copyItemsToLocalLibrary(_ itemIDs: [String]) async {
+        guard canCopyToLocalLibrary else { return }
+
+        let ordered = Array(Set(itemIDs)).sorted()
+        let copyCandidates = ordered.filter { itemID in
+            if let item = viewModel.item(withID: itemID) {
+                return !item.libraryID.hasPrefix(LocalLibraryManager.libraryIDPrefix)
+            }
+            return true
+        }
+        guard !copyCandidates.isEmpty else { return }
+
+        guard let targetRootID = viewModel.preferredLocalCopyRootID() else {
+            viewModel.setError("No local library available for copy")
+            return
+        }
+
+        let queuedNow = copyCandidates.filter { !downloadBusyItemIDs.contains($0) }
+        downloadQueuedItemIDs.formUnion(queuedNow)
+        for itemID in queuedNow where downloadRecoveredStateByItemID[itemID] == nil {
+            downloadRecoveredStateByItemID[itemID] = .queued
+        }
+
+        var copiedAny = false
+        for itemID in copyCandidates {
+            let didCopy = await copyItemToLocalLibrary(itemID, targetRootID: targetRootID)
+            copiedAny = copiedAny || didCopy
+        }
+
+        if copiedAny {
+            do {
+                try await viewModel.rescanLocalLibraryRoot(id: targetRootID)
+            } catch {
+                let targetName = viewModel.localLibraryRootName(rootID: targetRootID) ?? "Local Library"
+                viewModel.setError("Copied files, but failed to refresh \(targetName): \(viewModel.describeError(error))")
+            }
+        }
+    }
+
+    @discardableResult
+    private func copyItemToLocalLibrary(_ itemID: String, targetRootID: String) async -> Bool {
+        guard !downloadBusyItemIDs.contains(itemID) else { return false }
+
+        downloadQueuedItemIDs.remove(itemID)
+        downloadRecoveredStateByItemID[itemID] = .downloading
+        downloadBusyItemIDs.insert(itemID)
+        copiedToLocalItemIDs.remove(itemID)
+        downloadProgressByItemID[itemID] = 0
+        defer {
+            downloadBusyItemIDs.remove(itemID)
+            downloadProgressByItemID.removeValue(forKey: itemID)
+        }
+
+        do {
+            _ = try await viewModel.copyItemToLocalLibrary(
+                itemID: itemID,
+                targetRootID: targetRootID,
+                progress: { progress in
+                    await MainActor.run {
+                        downloadProgressByItemID[itemID] = progress
+                    }
+                }
+            )
+            downloadRecoveredStateByItemID.removeValue(forKey: itemID)
+            copiedToLocalItemIDs.insert(itemID)
+            return true
+        } catch {
+            viewModel.setError("Copy to local library failed: \(viewModel.describeError(error))")
+            downloadRecoveredStateByItemID[itemID] = .failed
+            return false
         }
     }
 
