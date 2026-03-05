@@ -3015,7 +3015,7 @@ struct ContentView: View {
     }
 
     private var metadataEditorItem: ABSCore.LibraryItem? {
-        guard let metadataEditorItemID else { return nil }
+        guard let metadataEditorItemID = resolvedMetadataEditorItemID() else { return nil }
         return viewModel.item(withID: metadataEditorItemID)
     }
 
@@ -3048,21 +3048,21 @@ struct ContentView: View {
                     Button("Quick Match") {
                         Task { await quickMatchFromMetadataEditor() }
                     }
-                    .disabled(metadataEditorBusy || metadataEditorItemID == nil)
+                    .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil)
 
                     Button("Re-Scan") {
-                        if let itemID = metadataEditorItemID {
+                        if let itemID = resolvedMetadataEditorItemID() {
                             openMetadataEditor(for: itemID)
                         }
                     }
-                    .disabled(metadataEditorBusy || metadataEditorItemID == nil)
+                    .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil)
                 }
 
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
                         Task { await saveMetadataEditor() }
                     }
-                    .disabled(metadataEditorBusy || metadataEditorItemID == nil)
+                    .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil)
                 }
             }
             .overlay {
@@ -3082,6 +3082,9 @@ struct ContentView: View {
                 }
             } message: {
                 Text(metadataEditorErrorMessage ?? "Unknown error")
+            }
+            .onAppear {
+                hydrateMetadataEditorContextIfNeeded()
             }
         }
         .frame(minWidth: 760, minHeight: 560)
@@ -3113,8 +3116,24 @@ struct ContentView: View {
             .filter { !$0.isEmpty }
     }
 
+    private func resolvedMetadataEditorItemID() -> String? {
+        if let metadataEditorItemID, viewModel.canEditMetadata(itemID: metadataEditorItemID) {
+            return metadataEditorItemID
+        }
+        if let selectedItemID, viewModel.canEditMetadata(itemID: selectedItemID) {
+            return selectedItemID
+        }
+        return nil
+    }
+
+    private func hydrateMetadataEditorContextIfNeeded() {
+        guard metadataEditorItemID == nil else { return }
+        guard let fallbackItemID = resolvedMetadataEditorItemID() else { return }
+        openMetadataEditor(for: fallbackItemID)
+    }
+
     private func saveMetadataEditor() async {
-        guard let itemID = metadataEditorItemID else { return }
+        guard let itemID = resolvedMetadataEditorItemID() else { return }
         metadataEditorBusy = true
         defer { metadataEditorBusy = false }
 
@@ -3143,7 +3162,7 @@ struct ContentView: View {
     }
 
     private func quickMatchFromMetadataEditor() async {
-        guard let itemID = metadataEditorItemID else { return }
+        guard let itemID = resolvedMetadataEditorItemID() else { return }
         metadataEditorBusy = true
         defer { metadataEditorBusy = false }
 
