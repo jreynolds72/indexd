@@ -161,12 +161,22 @@ final class AppPreferences: ObservableObject {
 
     @Published var isCapturingShortcut = false
 
+    @Published var localFileOrganizationEnabled: Bool {
+        didSet { defaults.set(localFileOrganizationEnabled, forKey: Keys.localFileOrganizationEnabled) }
+    }
+
+    @Published var localFileOrganizationTemplate: String {
+        didSet { defaults.set(localFileOrganizationTemplate, forKey: Keys.localFileOrganizationTemplate) }
+    }
+
     private enum Keys {
         static let legacySkipInterval = "abs.skip.seconds"
         static let skipBackward = "abs.skip.backward.seconds"
         static let skipForward = "abs.skip.forward.seconds"
         static let shortcutBindings = "abs.shortcut.bindings.v2"
         static let legacyShortcutBindings = "abs.shortcut.bindings.v1"
+        static let localFileOrganizationEnabled = "abs.local.file.organization.enabled"
+        static let localFileOrganizationTemplate = "abs.local.file.organization.template"
     }
 
     private let defaults: UserDefaults
@@ -205,6 +215,10 @@ final class AppPreferences: ObservableObject {
         } else {
             self.shortcutBindings = Self.defaultShortcutBindings
         }
+
+        self.localFileOrganizationEnabled = defaults.bool(forKey: Keys.localFileOrganizationEnabled)
+        let template = defaults.string(forKey: Keys.localFileOrganizationTemplate)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.localFileOrganizationTemplate = (template?.isEmpty == false) ? template! : Self.defaultLocalFileOrganizationTemplate
     }
 
     static let defaultShortcutBindings: [ShortcutAction: ShortcutActionBindings] = [
@@ -237,6 +251,8 @@ final class AppPreferences: ObservableObject {
             alternate: nil
         )
     ]
+
+    static let defaultLocalFileOrganizationTemplate = "<Author>/<Series>/<BookTitle>"
 
     func bindings(for action: ShortcutAction) -> ShortcutActionBindings {
         shortcutBindings[action] ?? Self.defaultShortcutBindings[action]!
