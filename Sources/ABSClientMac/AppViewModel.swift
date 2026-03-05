@@ -29,6 +29,7 @@ final class AppViewModel: ObservableObject {
     @Published var libraries: [ABSCore.Library] = []
     @Published var selectedLibraryID: String?
     @Published var displayedItems: [ABSCore.LibraryItem] = []
+    @Published private(set) var localLibraryRoots: [LocalLibraryRoot] = []
 
     private let defaults = UserDefaults.standard
     private let serverDefaultsKey = "abs.server.url"
@@ -36,10 +37,13 @@ final class AppViewModel: ObservableObject {
 
     private var itemsByLibrary: [String: [ABSCore.LibraryItem]] = [:]
     private var coverDataByItemID: [String: Data] = [:]
+    private var localLibraryIDs: Set<String> = []
+    private var localFileURLByItemID: [String: URL] = [:]
     private var apiClient: ABSAPIClient?
     private let downloadManager: DownloadManager?
     private let directDownloadTransport: DownloadTransport
     private let secureStore: SecureStoring
+    private let localLibraryManager = LocalLibraryManager()
     private var syncEngine: SyncEngine?
     private var syncOperationCount = 0
 
@@ -58,9 +62,16 @@ final class AppViewModel: ObservableObject {
     }
 
     func bootstrap() async {
+        await refreshLocalLibraries()
         if let savedServer = defaults.string(forKey: serverDefaultsKey), !savedServer.isEmpty {
             applyServerAddress(savedServer)
             await initializeClientFromSavedServer()
+        }
+        if selectedLibraryID == nil {
+            selectedLibraryID = libraries.first?.id
+            if let selectedLibraryID {
+                displayedItems = itemsByLibrary[selectedLibraryID] ?? []
+            }
         }
     }
 
@@ -99,13 +110,16 @@ final class AppViewModel: ObservableObject {
     }
 
     func reloadLibraries() async throws {
-        guard let apiClient else { return }
+        let remoteLibraries: [ABSCore.Library]
+        if let apiClient {
+            remoteLibraries = try await apiClient.libraries()
+        } else {
+            remoteLibraries = []
+        }
+        libraries = mergedLibraries(remote: remoteLibraries)
 
-        let loaded = try await apiClient.libraries()
-        libraries = loaded
-
-        if selectedLibraryID == nil || !loaded.contains(where: { $0.id == selectedLibraryID }) {
-            selectedLibraryID = loaded.first?.id
+        if selectedLibraryID == nil || !libraries.contains(where: { $0.id == selectedLibraryID }) {
+            selectedLibraryID = libraries.first?.id
         }
 
         if let selectedLibraryID {
@@ -116,13 +130,16 @@ final class AppViewModel: ObservableObject {
     }
 
     func refreshLibrariesMetadataOnly() async throws {
-        guard let apiClient else { return }
+        let remoteLibraries: [ABSCore.Library]
+        if let apiClient {
+            remoteLibraries = try await apiClient.libraries()
+        } else {
+            remoteLibraries = []
+        }
+        libraries = mergedLibraries(remote: remoteLibraries)
 
-        let loaded = try await apiClient.libraries()
-        libraries = loaded
-
-        if selectedLibraryID == nil || !loaded.contains(where: { $0.id == selectedLibraryID }) {
-            selectedLibraryID = loaded.first?.id
+        if selectedLibraryID == nil || !libraries.contains(where: { $0.id == selectedLibraryID }) {
+            selectedLibraryID = libraries.first?.id
         }
     }
 
@@ -141,12 +158,25 @@ final class AppViewModel: ObservableObject {
     }
 
     func search(query: String) async {
-        guard let apiClient else { return }
-
         let baseItems = itemsByLibrary[selectedLibraryID ?? ""] ?? []
 
         if query.isEmpty {
             displayedItems = baseItems
+            return
+        }
+
+        if isLocalLibrary(id: selectedLibraryID), apiClient == nil {
+            displayedItems = locallyFilteredItems(baseItems: baseItems, query: query)
+            return
+        }
+
+        guard let apiClient else {
+            displayedItems = locallyFilteredItems(baseItems: baseItems, query: query)
+            return
+        }
+
+        if isLocalLibrary(id: selectedLibraryID) {
+            displayedItems = locallyFilteredItems(baseItems: baseItems, query: query)
             return
         }
 
@@ -155,21 +185,26 @@ final class AppViewModel: ObservableObject {
             displayedItems = mergeSearchResultsPreservingKnownFields(results, baseItems: baseItems)
         } catch {
             if case APIError.requestFailed(statusCode: 404) = error {
-                // Fallback for servers without exposed search endpoint.
-                displayedItems = baseItems.filter { item in
-                    item.title.localizedCaseInsensitiveContains(query)
-                        || (item.author?.localizedCaseInsensitiveContains(query) ?? false)
-                }
+                displayedItems = locallyFilteredItems(baseItems: baseItems, query: query)
                 return
             }
-
             errorMessage = "Search failed: \(describe(error))"
         }
     }
 
     func liveRefreshCurrentContext(searchQuery: String) async {
-        guard let apiClient else { return }
         guard let libraryID = selectedLibraryID else { return }
+        if isLocalLibrary(id: libraryID) {
+            await refreshLocalLibraries()
+            let freshItems = itemsByLibrary[libraryID] ?? []
+            let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            displayedItems = query.isEmpty
+                ? freshItems
+                : locallyFilteredItems(baseItems: freshItems, query: query)
+            return
+        }
+
+        guard let apiClient else { return }
 
         do {
             let freshItems = try await apiClient.items(in: libraryID)
@@ -217,6 +252,9 @@ final class AppViewModel: ObservableObject {
     }
 
     func streamURL(for itemID: String) async throws -> URL {
+        if let local = localFileURLByItemID[itemID] {
+            return local
+        }
         guard let apiClient else {
             throw APIError.invalidResponse
         }
@@ -224,6 +262,9 @@ final class AppViewModel: ObservableObject {
     }
 
     func playbackChapters(for itemID: String) async throws -> [ABSCore.Chapter] {
+        if let localItem = item(withID: itemID), !localItem.chapters.isEmpty {
+            return localItem.chapters
+        }
         guard let apiClient else {
             throw APIError.invalidResponse
         }
@@ -340,6 +381,9 @@ final class AppViewModel: ObservableObject {
     }
 
     func playbackURL(for itemID: String) async throws -> URL {
+        if let local = localFileURLByItemID[itemID] {
+            return local
+        }
         if let localURL = await localDownloadURL(for: itemID) {
             return localURL
         }
@@ -390,14 +434,16 @@ final class AppViewModel: ObservableObject {
         isAuthenticated = false
         isConnecting = false
         errorMessage = nil
-        libraries = []
-        selectedLibraryID = nil
-        displayedItems = []
-        itemsByLibrary = [:]
-        coverDataByItemID = [:]
+        let selectedLocalID = selectedLibraryID.flatMap { id in isLocalLibrary(id: id) ? id : nil }
+        selectedLibraryID = selectedLocalID
         liveTransportProbe = nil
         password = ""
         defaults.removeObject(forKey: serverDefaultsKey)
+        await refreshLocalLibraries()
+        if selectedLibraryID == nil {
+            selectedLibraryID = libraries.first?.id
+        }
+        displayedItems = itemsByLibrary[selectedLibraryID ?? ""] ?? []
     }
 
     var serverAddressDisplay: String {
@@ -407,6 +453,77 @@ final class AppViewModel: ObservableObject {
 
     var currentLibraryItems: [ABSCore.LibraryItem] {
         itemsByLibrary[selectedLibraryID ?? ""] ?? displayedItems
+    }
+
+    var hasAnyLibraries: Bool {
+        !libraries.isEmpty
+    }
+
+    var hasLocalLibraries: Bool {
+        !localLibraryIDs.isEmpty
+    }
+
+    var canCopyFromSelectedLibraryToLocal: Bool {
+        guard isAuthenticated else { return false }
+        guard !localLibraryRoots.isEmpty else { return false }
+        guard let selectedLibraryID else { return false }
+        return !isLocalLibrary(id: selectedLibraryID)
+    }
+
+    func preferredLocalCopyRootID() -> String? {
+        localLibraryRoots.first?.id
+    }
+
+    func localLibraryRootName(rootID: String) -> String? {
+        localLibraryRoots.first(where: { $0.id == rootID })?.name
+    }
+
+    func addLocalLibraryRoot(directoryURL: URL) async throws {
+        _ = try await localLibraryManager.addRoot(directoryURL: directoryURL)
+        await refreshLocalLibraries()
+        if selectedLibraryID == nil || !libraries.contains(where: { $0.id == selectedLibraryID }) {
+            selectedLibraryID = libraries.first?.id
+        }
+        if let selectedLibraryID {
+            displayedItems = itemsByLibrary[selectedLibraryID] ?? []
+        }
+    }
+
+    func rescanLocalLibraries() async throws {
+        try await localLibraryManager.rescanAll()
+        await refreshLocalLibraries()
+        if let selectedLibraryID {
+            displayedItems = itemsByLibrary[selectedLibraryID] ?? []
+        }
+    }
+
+    func rescanLocalLibraryRoot(id: String) async throws {
+        try await localLibraryManager.rescanRoot(id: id)
+        await refreshLocalLibraries()
+        if let selectedLibraryID {
+            displayedItems = itemsByLibrary[selectedLibraryID] ?? []
+        }
+    }
+
+    @discardableResult
+    func copyItemToLocalLibrary(
+        itemID: String,
+        targetRootID: String,
+        progress: (@Sendable (Double) async -> Void)? = nil
+    ) async throws -> URL {
+        guard !isLocalLibrary(id: selectedLibraryID) else {
+            throw DownloadFeatureError.unavailable
+        }
+
+        guard let targetRoot = localLibraryRoots.first(where: { $0.id == targetRootID }) else {
+            throw DownloadFeatureError.unavailable
+        }
+
+        return try await downloadItemToDirectory(
+            itemID: itemID,
+            directoryURL: targetRoot.directoryURL,
+            progress: progress
+        )
     }
 
     func allKnownItems() -> [ABSCore.LibraryItem] {
@@ -592,11 +709,18 @@ final class AppViewModel: ObservableObject {
     }
 
     func fetchProgress(itemID: String) async throws -> PlaybackProgress? {
+        if localFileURLByItemID[itemID] != nil {
+            return nil
+        }
         guard let apiClient else { return nil }
         return try await apiClient.fetchProgress(itemID: itemID)
     }
 
     private func loadItems(for libraryID: String) async throws {
+        if isLocalLibrary(id: libraryID) {
+            displayedItems = itemsByLibrary[libraryID] ?? []
+            return
+        }
         guard let apiClient else { return }
 
         if let cached = itemsByLibrary[libraryID] {
@@ -713,10 +837,67 @@ final class AppViewModel: ObservableObject {
             if await client.hasPersistedLogin() {
                 isAuthenticated = true
                 try await reloadLibraries()
+            } else {
+                libraries = mergedLibraries(remote: [])
             }
         } catch {
             isAuthenticated = false
             liveTransportProbe = nil
+        }
+    }
+
+    private func refreshLocalLibraries() async {
+        let previousLocalLibraryIDs = localLibraryIDs
+        let previousLocalItemIDs = Set(localFileURLByItemID.keys)
+        let snapshot = await localLibraryManager.snapshot()
+        localLibraryRoots = snapshot.roots
+        localLibraryIDs = Set(snapshot.libraries.map(\.id))
+        localFileURLByItemID = snapshot.fileURLByItemID
+
+        // Remove previous local data before applying fresh snapshot.
+        for localLibraryID in previousLocalLibraryIDs {
+            itemsByLibrary.removeValue(forKey: localLibraryID)
+        }
+        for localItemID in previousLocalItemIDs {
+            coverDataByItemID.removeValue(forKey: localItemID)
+        }
+
+        for (libraryID, items) in snapshot.itemsByLibrary {
+            itemsByLibrary[libraryID] = items
+        }
+        for (itemID, data) in snapshot.coverDataByItemID {
+            coverDataByItemID[itemID] = data
+        }
+
+        let remoteLibraries = libraries.filter { !isLocalLibrary(id: $0.id) }
+        libraries = mergedLibraries(remote: remoteLibraries, local: snapshot.libraries)
+
+        if let selectedLibraryID, localLibraryIDs.contains(selectedLibraryID) {
+            displayedItems = itemsByLibrary[selectedLibraryID] ?? []
+        }
+    }
+
+    private func mergedLibraries(remote: [ABSCore.Library], local: [ABSCore.Library]? = nil) -> [ABSCore.Library] {
+        let localLibraries = local ?? localLibraryRoots.map { root in
+            ABSCore.Library(id: LocalLibraryManager.libraryIDPrefix + root.id, name: root.name)
+        }
+        return (remote + localLibraries).sorted { lhs, rhs in
+            lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+    }
+
+    private func isLocalLibrary(id: String?) -> Bool {
+        guard let id else { return false }
+        return id.hasPrefix(LocalLibraryManager.libraryIDPrefix)
+    }
+
+    private func locallyFilteredItems(baseItems: [ABSCore.LibraryItem], query: String) -> [ABSCore.LibraryItem] {
+        baseItems.filter { item in
+            item.title.localizedCaseInsensitiveContains(query)
+                || (item.author?.localizedCaseInsensitiveContains(query) ?? false)
+                || item.authors.contains(where: { $0.localizedCaseInsensitiveContains(query) })
+                || (item.narrator?.localizedCaseInsensitiveContains(query) ?? false)
+                || (item.seriesName?.localizedCaseInsensitiveContains(query) ?? false)
         }
     }
 
