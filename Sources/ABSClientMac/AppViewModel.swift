@@ -478,6 +478,17 @@ final class AppViewModel: ObservableObject {
         return !isLocalLibrary(id: selectedLibraryID)
     }
 
+    var isSelectedLibraryLocal: Bool {
+        isLocalLibrary(id: selectedLibraryID)
+    }
+
+    func selectedLocalLibraryRootURL() -> URL? {
+        guard let selectedLibraryID else { return nil }
+        guard selectedLibraryID.hasPrefix(LocalLibraryManager.libraryIDPrefix) else { return nil }
+        let rootID = String(selectedLibraryID.dropFirst(LocalLibraryManager.libraryIDPrefix.count))
+        return localLibraryRoots.first(where: { $0.id == rootID })?.directoryURL
+    }
+
     func preferredLocalCopyRootID() -> String? {
         localLibraryRoots.first?.id
     }
