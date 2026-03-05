@@ -14,6 +14,20 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    private enum LocalCopyError: LocalizedError {
+        case sourceAlreadyLocal
+        case localRootUnavailable
+
+        var errorDescription: String? {
+            switch self {
+            case .sourceAlreadyLocal:
+                return "Item is already in a local library"
+            case .localRootUnavailable:
+                return "Selected local library folder is unavailable"
+            }
+        }
+    }
+
     @Published var serverScheme: String = "http"
     @Published var serverHost: String = ""
     @Published var serverPortText: String = "13378"
@@ -530,12 +544,13 @@ final class AppViewModel: ObservableObject {
         targetRootID: String,
         progress: (@Sendable (Double) async -> Void)? = nil
     ) async throws -> URL {
-        guard !isLocalLibrary(id: selectedLibraryID) else {
-            throw DownloadFeatureError.unavailable
+        if let sourceItem = item(withID: itemID),
+           sourceItem.libraryID.hasPrefix(LocalLibraryManager.libraryIDPrefix) {
+            throw LocalCopyError.sourceAlreadyLocal
         }
 
         guard let targetRoot = localLibraryRoots.first(where: { $0.id == targetRootID }) else {
-            throw DownloadFeatureError.unavailable
+            throw LocalCopyError.localRootUnavailable
         }
 
         return try await downloadItemToDirectory(
