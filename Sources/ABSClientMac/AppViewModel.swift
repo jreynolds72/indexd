@@ -44,8 +44,16 @@ final class AppViewModel: ObservableObject {
     private let directDownloadTransport: DownloadTransport
     private let secureStore: SecureStoring
     private let localLibraryManager = LocalLibraryManager()
+    private lazy var localLibraryWatcher = LocalLibraryWatcher { [weak self] in
+        guard let self else { return }
+        Task { @MainActor in
+            await self.handleLocalLibraryWatcherEvent()
+        }
+    }
     private var syncEngine: SyncEngine?
     private var syncOperationCount = 0
+    private var isHandlingLocalLibraryWatcherEvent = false
+    private var hasPendingLocalLibraryWatcherEvent = false
 
     init() {
         #if DEBUG
@@ -853,6 +861,7 @@ final class AppViewModel: ObservableObject {
         localLibraryRoots = snapshot.roots
         localLibraryIDs = Set(snapshot.libraries.map(\.id))
         localFileURLByItemID = snapshot.fileURLByItemID
+        localLibraryWatcher.updateRoots(localLibraryRoots.map(\.directoryURL))
 
         // Remove previous local data before applying fresh snapshot.
         for localLibraryID in previousLocalLibraryIDs {
@@ -875,6 +884,26 @@ final class AppViewModel: ObservableObject {
         if let selectedLibraryID, localLibraryIDs.contains(selectedLibraryID) {
             displayedItems = itemsByLibrary[selectedLibraryID] ?? []
         }
+    }
+
+    private func handleLocalLibraryWatcherEvent() async {
+        if isHandlingLocalLibraryWatcherEvent {
+            hasPendingLocalLibraryWatcherEvent = true
+            return
+        }
+
+        repeat {
+            hasPendingLocalLibraryWatcherEvent = false
+            isHandlingLocalLibraryWatcherEvent = true
+            defer { isHandlingLocalLibraryWatcherEvent = false }
+
+            do {
+                try await localLibraryManager.rescanAll()
+                await refreshLocalLibraries()
+            } catch {
+                // Keep app usable even if a transient filesystem event fails.
+            }
+        } while hasPendingLocalLibraryWatcherEvent
     }
 
     private func mergedLibraries(remote: [ABSCore.Library], local: [ABSCore.Library]? = nil) -> [ABSCore.Library] {
