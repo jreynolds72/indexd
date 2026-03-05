@@ -4926,10 +4926,8 @@ struct ContentView: View {
 
         let ordered = Array(Set(itemIDs)).sorted()
         let copyCandidates = ordered.filter { itemID in
-            if let item = viewModel.item(withID: itemID) {
-                return !item.libraryID.hasPrefix(LocalLibraryManager.libraryIDPrefix)
-            }
-            return true
+            guard let item = viewModel.item(withID: itemID) else { return false }
+            return !item.libraryID.hasPrefix(LocalLibraryManager.libraryIDPrefix)
         }
         guard !copyCandidates.isEmpty else { return }
 
