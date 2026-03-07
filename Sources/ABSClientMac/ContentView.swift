@@ -2,6 +2,7 @@ import SwiftUI
 import AVFoundation
 import AppKit
 import OSLog
+import UniformTypeIdentifiers
 import ABSCore
 
 struct ContentView: View {
@@ -293,6 +294,13 @@ struct ContentView: View {
         var publishedYearText: String
     }
 
+    private enum MetadataEditorTab: String, CaseIterable, Identifiable {
+        case details = "Details"
+        case cover = "Cover"
+
+        var id: String { rawValue }
+    }
+
     private let mediaIntegration = MacMediaIntegrationManager.shared
     private let progressDefaultsKey = "abs.local.progress.v1"
     private let progressHistoryDefaultsKey = "abs.local.progress.history.v1"
@@ -388,6 +396,16 @@ struct ContentView: View {
     )
     @State private var metadataEditorBusy = false
     @State private var metadataEditorErrorMessage: String?
+    @State private var metadataEditorTab: MetadataEditorTab = .details
+    @State private var metadataCoverSearchTitle = ""
+    @State private var metadataCoverSearchAuthor = ""
+    @State private var metadataCoverSearchResults: [AppViewModel.CoverSearchResult] = []
+    @State private var metadataCoverSearchBusy = false
+    @State private var metadataSelectedCoverResultID: String?
+    @State private var metadataPendingCoverData: Data?
+    @State private var metadataPendingCoverImage: NSImage?
+    @State private var metadataCoverURLText = ""
+    @State private var showingMetadataCoverFileImporter = false
     @State private var showingManualMetadataMatch = false
     @State private var manualMetadataMatchQuery = ""
     @State private var manualMetadataMatchCandidates: [MetadataMatchCandidate] = []
@@ -851,12 +869,14 @@ struct ContentView: View {
                 ) {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 72), spacing: 6)], alignment: .leading, spacing: 6) {
                         ForEach(libraryBrowseTabs, id: \.rawValue) { tab in
+                            let isSelectedLibrary = viewModel.selectedLibraryID == library.id
+                            let isActiveTab = isSelectedLibrary && currentBrowseTab(for: library.id) == tab
                             Button(tab.rawValue) {
                                 selectLibrary(libraryID: library.id, browseTab: tab)
                             }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.mini)
-                            .tint(currentBrowseTab(for: library.id) == tab ? .accentColor : .gray.opacity(0.32))
+                            .tint(isActiveTab ? .accentColor : .gray.opacity(0.32))
                         }
                     }
                     .padding(.vertical, 4)
@@ -1182,8 +1202,11 @@ struct ContentView: View {
                 itemListRowCover(for: item)
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(item.title)
-                        .font(.headline)
+                    HStack(spacing: 6) {
+                        Text(item.title)
+                            .font(.headline)
+                        editionBadge(for: item)
+                    }
                     if let author = item.author {
                         Text(author)
                             .font(.subheadline)
@@ -1248,13 +1271,6 @@ struct ContentView: View {
                         Task { await setPlayedState(for: contextItemIDs, isPlayed: false) }
                     }
                 } else {
-                    Button("Edit Metadata…") {
-                        openMetadataEditor(for: item.id)
-                    }
-                    .disabled(!viewModel.canEditMetadata(itemID: item.id))
-
-                    Divider()
-
                     Button("Start from Beginning") {
                         selectedItemID = item.id
                         selectedItemIDs = [item.id]
@@ -1290,6 +1306,13 @@ struct ContentView: View {
                             Task { await setPlayedState(for: [item.id], isPlayed: true) }
                         }
                     }
+
+                    Divider()
+
+                    Button("Edit Metadata…") {
+                        openMetadataEditor(for: item.id)
+                    }
+                    .disabled(!viewModel.canEditMetadata(itemID: item.id))
 
                     Divider()
 
@@ -1490,8 +1513,11 @@ struct ContentView: View {
                                             .font(.caption.weight(.semibold))
                                             .foregroundStyle(.secondary)
                                     }
-                                    Text(item.title)
-                                        .font(.headline)
+                                    HStack(spacing: 6) {
+                                        Text(item.title)
+                                            .font(.headline)
+                                        editionBadge(for: item)
+                                    }
                                     if let author = item.author {
                                         Text(author)
                                             .font(.subheadline)
@@ -1539,11 +1565,14 @@ struct ContentView: View {
                         }
 
                         VStack(spacing: 8) {
-                            Text(item.title)
-                                .font(.largeTitle)
-                                .lineLimit(3)
-                                .minimumScaleFactor(0.75)
-                                .multilineTextAlignment(.center)
+                            VStack(spacing: 6) {
+                                Text(item.title)
+                                    .font(.largeTitle)
+                                    .lineLimit(3)
+                                    .minimumScaleFactor(0.75)
+                                    .multilineTextAlignment(.center)
+                                editionBadge(for: item)
+                            }
                             let authors = displayAuthorNames(for: item)
                             if !authors.isEmpty {
                                 VStack(spacing: 2) {
@@ -1647,6 +1676,10 @@ struct ContentView: View {
                             if let series = seriesValue(for: item) {
                                 detailRow(title: "Series", value: series)
                             }
+                            detailRow(
+                                title: "Edition",
+                                value: editionVariant(for: item) == .dramatized ? "Dramatized" : "Standard"
+                            )
                             if let publisher = item.publisher, !publisher.isEmpty {
                                 detailRow(title: "Publisher", value: publisher)
                             }
@@ -3026,25 +3059,41 @@ struct ContentView: View {
 
     private var metadataEditorSheet: some View {
         NavigationStack {
-            Form {
-                Section("Details") {
-                    TextField("Title", text: $metadataEditorDraft.title)
-                    TextField("Authors (comma-separated)", text: $metadataEditorDraft.authorsText)
-                    TextField("Narrators (comma-separated)", text: $metadataEditorDraft.narrator)
-                    TextField("Series", text: $metadataEditorDraft.seriesName)
-                    TextField("Publish Year", text: $metadataEditorDraft.publishedYearText)
-                    TextField("Publisher", text: $metadataEditorDraft.publisher)
-                    TextField("Language", text: $metadataEditorDraft.language)
+            VStack(spacing: 0) {
+                Picker("Metadata Tab", selection: $metadataEditorTab) {
+                    ForEach(MetadataEditorTab.allCases) { tab in
+                        Text(tab.rawValue).tag(tab)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 12)
+                .padding(.top, 12)
+                .padding(.bottom, 8)
 
-                Section("Description") {
-                    TextEditor(text: $metadataEditorDraft.blurb)
-                        .frame(minHeight: 100)
-                }
+                if metadataEditorTab == .details {
+                    Form {
+                        Section("Details") {
+                            TextField("Title", text: $metadataEditorDraft.title)
+                            TextField("Authors (comma-separated)", text: $metadataEditorDraft.authorsText)
+                            TextField("Narrators (comma-separated)", text: $metadataEditorDraft.narrator)
+                            TextField("Series", text: $metadataEditorDraft.seriesName)
+                            TextField("Publish Year", text: $metadataEditorDraft.publishedYearText)
+                            TextField("Publisher", text: $metadataEditorDraft.publisher)
+                            TextField("Language", text: $metadataEditorDraft.language)
+                        }
 
-                Section("Classification") {
-                    TextField("Genres (comma-separated)", text: $metadataEditorDraft.genresText)
-                    TextField("Tags (comma-separated)", text: $metadataEditorDraft.tagsText)
+                        Section("Description") {
+                            TextEditor(text: $metadataEditorDraft.blurb)
+                                .frame(minHeight: 100)
+                        }
+
+                        Section("Classification") {
+                            TextField("Genres (comma-separated)", text: $metadataEditorDraft.genresText)
+                            TextField("Tags (comma-separated)", text: $metadataEditorDraft.tagsText)
+                        }
+                    }
+                } else {
+                    metadataCoverTab
                 }
             }
             .safeAreaInset(edge: .bottom) {
@@ -3052,19 +3101,26 @@ struct ContentView: View {
                     Button("Quick Match") {
                         Task { await quickMatchFromMetadataEditor() }
                     }
-                    .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil)
+                    .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil || metadataEditorTab != .details)
 
                     Button("Match…") {
                         openManualMetadataMatch()
                     }
-                    .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil)
+                    .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil || metadataEditorTab != .details)
 
                     Button("Re-Scan") {
                         if let itemID = resolvedMetadataEditorItemID() {
                             openMetadataEditor(for: itemID)
                         }
                     }
-                    .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil)
+                    .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil || metadataEditorTab != .details)
+
+                    if metadataEditorTab == .cover {
+                        Button("Apply Cover") {
+                            Task { await applySelectedCoverFromMetadataEditor() }
+                        }
+                        .disabled(metadataEditorBusy || resolvedMetadataEditorItemID() == nil || metadataPendingCoverData == nil)
+                    }
 
                     Spacer()
 
@@ -3107,6 +3163,13 @@ struct ContentView: View {
             .sheet(isPresented: $showingManualMetadataMatch) {
                 manualMetadataMatchSheet
             }
+            .fileImporter(
+                isPresented: $showingMetadataCoverFileImporter,
+                allowedContentTypes: [.image],
+                allowsMultipleSelection: false
+            ) { result in
+                handleMetadataCoverImport(result: result)
+            }
         }
         .frame(minWidth: 760, minHeight: 560)
     }
@@ -3116,12 +3179,188 @@ struct ContentView: View {
         return manualMetadataMatchCandidates.first(where: { $0.id == manualMetadataMatchSelectedCandidateID })
     }
 
+    private var selectedMetadataCoverResult: AppViewModel.CoverSearchResult? {
+        guard let metadataSelectedCoverResultID else { return nil }
+        return metadataCoverSearchResults.first(where: { $0.id == metadataSelectedCoverResultID })
+    }
+
+    private var metadataCurrentCoverImage: NSImage? {
+        if let metadataPendingCoverImage {
+            return metadataPendingCoverImage
+        }
+        guard let itemID = resolvedMetadataEditorItemID() else { return nil }
+        return coverImagesByItemID[itemID]
+    }
+
+    private var metadataCoverTab: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .top, spacing: 14) {
+                    Group {
+                        if let image = metadataCurrentCoverImage {
+                            Image(nsImage: image)
+                                .resizable()
+                                .scaledToFit()
+                        } else {
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(Color.secondary.opacity(0.2))
+                                .overlay {
+                                    Image(systemName: "photo")
+                                        .font(.system(size: 24, weight: .semibold))
+                                        .foregroundStyle(.secondary)
+                                }
+                        }
+                    }
+                    .frame(width: 140, height: 140)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let image = metadataCurrentCoverImage {
+                            Text("\(Int(image.size.width))×\(Int(image.size.height))px")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("No cover selected")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        HStack(spacing: 8) {
+                            Button("Upload Cover") {
+                                showingMetadataCoverFileImporter = true
+                            }
+                            .disabled(metadataEditorBusy)
+
+                            TextField("Image URL from the web", text: $metadataCoverURLText)
+                                .textFieldStyle(.roundedBorder)
+
+                            Button("Use URL") {
+                                Task { await applyCoverURLToPendingSelection() }
+                            }
+                            .disabled(metadataEditorBusy || metadataCoverURLText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                    }
+                }
+
+                Divider()
+
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Provider")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Picker("Provider", selection: .constant("Audible.com")) {
+                            Text("Audible.com").tag("Audible.com")
+                        }
+                        .labelsHidden()
+                        .frame(width: 150)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Search Title or ASIN")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("Title or ASIN", text: $metadataCoverSearchTitle)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: .infinity)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Author")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("Author", text: $metadataCoverSearchAuthor)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 220)
+                    }
+
+                    Button("Search") {
+                        Task { await runMetadataCoverSearch() }
+                    }
+                    .disabled(metadataEditorBusy || metadataCoverSearchBusy || metadataCoverSearchTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+
+                if metadataCoverSearchBusy {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Searching Audible covers…")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if !metadataCoverSearchResults.isEmpty {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 12)], spacing: 12) {
+                        ForEach(metadataCoverSearchResults) { result in
+                            metadataCoverSearchResultCard(result)
+                        }
+                    }
+                } else if !metadataCoverSearchBusy {
+                    Text("No search results yet.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(12)
+        }
+    }
+
+    private func metadataCoverSearchResultCard(_ result: AppViewModel.CoverSearchResult) -> some View {
+        Button {
+            metadataSelectedCoverResultID = result.id
+            Task { await setPendingCover(from: result.imageURL) }
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                AsyncImage(url: result.imageURL) { phase in
+                    switch phase {
+                    case .empty:
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color.secondary.opacity(0.15))
+                            .overlay { ProgressView() }
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFit()
+                    case .failure:
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color.secondary.opacity(0.15))
+                            .overlay {
+                                Image(systemName: "photo")
+                                    .foregroundStyle(.secondary)
+                            }
+                    @unknown default:
+                        EmptyView()
+                    }
+                }
+                .frame(height: 160)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                Text(result.title)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(2)
+                if !result.authors.isEmpty {
+                    Text(result.authors.joined(separator: ", "))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .padding(6)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(metadataSelectedCoverResultID == result.id ? Color.accentColor : Color.secondary.opacity(0.25), lineWidth: metadataSelectedCoverResultID == result.id ? 2 : 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
     private var manualMetadataMatchSheet: some View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 12) {
                 manualMetadataMatchSearchRow
                 manualMetadataMatchStatusRow
                 manualMetadataMatchCandidateList
+                manualMetadataPreviewSection
             }
             .padding(12)
             .navigationTitle("Match Metadata")
@@ -3175,7 +3414,132 @@ struct ContentView: View {
             List(manualMetadataMatchCandidates) { candidate in
                 manualMetadataMatchCandidateRow(candidate)
             }
+            .frame(minHeight: 180)
         }
+    }
+
+    @ViewBuilder
+    private var manualMetadataPreviewSection: some View {
+        if let candidate = selectedManualMetadataMatchCandidate,
+           let itemID = resolvedMetadataEditorItemID(),
+           let localItem = viewModel.item(withID: itemID) {
+            let changed = metadataChangedFields(local: localItem, candidate: candidate)
+            VStack(alignment: .leading, spacing: 8) {
+                Divider()
+                Text("Metadata Preview")
+                    .font(.headline)
+                if changed.isEmpty {
+                    Text("No metadata changes.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Changed Fields: \(changed.joined(separator: ", "))")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.orange)
+                }
+                HStack(alignment: .top, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Current")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        metadataPreviewRow(label: "Title", value: localItem.title)
+                        metadataPreviewRow(label: "Authors", value: displayAuthorNames(for: localItem).joined(separator: ", "))
+                        metadataPreviewRow(label: "Narrator", value: preferredNarrator(for: localItem))
+                        metadataPreviewRow(label: "Series", value: localItem.seriesName)
+                        metadataPreviewRow(label: "Series #", value: localItem.seriesSequence.map(String.init))
+                        metadataPreviewRow(label: "Year", value: localItem.publishedYear.map(String.init))
+                        metadataPreviewRow(label: "Publisher", value: localItem.publisher)
+                        metadataPreviewRow(label: "Language", value: localItem.language)
+                        metadataPreviewRow(label: "Genres", value: localItem.genres.joined(separator: ", "))
+                        metadataPreviewRow(label: "Tags", value: localItem.tags.joined(separator: ", "))
+                        metadataPreviewRow(label: "Duration", value: formattedDuration(localItem.duration))
+                    }
+                    Divider()
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Matched (\(candidate.source))")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        metadataPreviewRow(label: "Title", value: candidate.title)
+                        metadataPreviewRow(label: "Authors", value: candidate.authors.joined(separator: ", "))
+                        metadataPreviewRow(label: "Narrator", value: candidate.narrator)
+                        metadataPreviewRow(label: "Series", value: candidate.seriesName)
+                        metadataPreviewRow(label: "Series #", value: candidate.seriesSequence.map(String.init))
+                        metadataPreviewRow(label: "Year", value: candidate.publishedYear.map(String.init))
+                        metadataPreviewRow(label: "Publisher", value: candidate.publisher)
+                        metadataPreviewRow(label: "Language", value: candidate.language)
+                        metadataPreviewRow(label: "Genres", value: candidate.genres.joined(separator: ", "))
+                        metadataPreviewRow(label: "Tags", value: candidate.tags.joined(separator: ", "))
+                        metadataPreviewRow(label: "Duration", value: formattedDuration(candidate.durationSeconds))
+                    }
+                }
+                if candidate.isExactRuntimeMatch {
+                    Text("Exact Match: runtime is within 1% of local duration.")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                }
+            }
+        }
+    }
+
+    private func metadataPreviewRow(label: String, value: String?) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text("\(label):")
+                .foregroundStyle(.secondary)
+            Text((value?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) ? value! : "—")
+                .lineLimit(2)
+                .textSelection(.enabled)
+        }
+        .font(.caption)
+    }
+
+    private func metadataChangedFields(local: ABSCore.LibraryItem, candidate: MetadataMatchCandidate) -> [String] {
+        var fields: [String] = []
+
+        if normalizedScalar(local.title) != normalizedScalar(candidate.title) {
+            fields.append("Title")
+        }
+        if normalizedScalar(local.author ?? local.authors.first) != normalizedScalar(candidate.authors.first) {
+            fields.append("Author")
+        }
+        if normalizedList(local.authors) != normalizedList(candidate.authors) {
+            fields.append("Authors")
+        }
+        if normalizedScalar(local.narrator) != normalizedScalar(candidate.narrator) {
+            fields.append("Narrator")
+        }
+        if normalizedScalar(local.seriesName) != normalizedScalar(candidate.seriesName) {
+            fields.append("Series")
+        }
+        if local.seriesSequence != candidate.seriesSequence {
+            fields.append("Series #")
+        }
+        if local.publishedYear != candidate.publishedYear {
+            fields.append("Year")
+        }
+        if normalizedScalar(local.publisher) != normalizedScalar(candidate.publisher) {
+            fields.append("Publisher")
+        }
+        if normalizedScalar(local.language) != normalizedScalar(candidate.language) {
+            fields.append("Language")
+        }
+        if normalizedList(local.genres) != normalizedList(candidate.genres) {
+            fields.append("Genres")
+        }
+        if normalizedList(local.tags) != normalizedList(candidate.tags) {
+            fields.append("Tags")
+        }
+
+        return fields
+    }
+
+    private func normalizedScalar(_ value: String?) -> String {
+        value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    }
+
+    private func normalizedList(_ values: [String]) -> [String] {
+        values
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
     }
 
     private func manualMetadataMatchCandidateRow(_ candidate: MetadataMatchCandidate) -> some View {
@@ -3195,6 +3559,11 @@ struct ContentView: View {
                     Text(candidate.confidenceReason)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                    if candidate.isExactRuntimeMatch {
+                        Text("Exact Match")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.green)
+                    }
                 }
                 Spacer()
                 Text("\(Int((candidate.confidence * 100).rounded()))%")
@@ -3213,6 +3582,14 @@ struct ContentView: View {
         guard let item = viewModel.item(withID: itemID) else { return }
         metadataEditorItemID = itemID
         metadataEditorDraft = metadataEditorDraft(from: item)
+        metadataEditorTab = .details
+        metadataCoverSearchTitle = item.title
+        metadataCoverSearchAuthor = displayAuthorNames(for: item).first ?? ""
+        metadataCoverSearchResults = []
+        metadataSelectedCoverResultID = nil
+        metadataPendingCoverData = nil
+        metadataPendingCoverImage = nil
+        metadataCoverURLText = ""
         metadataEditorErrorMessage = nil
         showingMetadataEditor = true
     }
@@ -3296,7 +3673,8 @@ struct ContentView: View {
         do {
             let didApply = try await viewModel.applyLocalMetadataCandidate(itemID: itemID, candidate: candidate)
             guard didApply else {
-                metadataEditorErrorMessage = "Selected match did not change metadata."
+                showingManualMetadataMatch = false
+                metadataEditorErrorMessage = "No metadata changes were needed. The selected match is already reflected in this item."
                 return
             }
             if let refreshed = viewModel.item(withID: itemID) {
@@ -3334,6 +3712,100 @@ struct ContentView: View {
             }
         } catch {
             metadataEditorErrorMessage = "Failed saving metadata: \(viewModel.describeError(error))"
+        }
+    }
+
+    private func runMetadataCoverSearch() async {
+        let title = metadataCoverSearchTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return }
+        let author = metadataCoverSearchAuthor.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        metadataCoverSearchBusy = true
+        defer { metadataCoverSearchBusy = false }
+
+        do {
+            let results = try await viewModel.searchAudibleCovers(
+                title: title,
+                author: author.isEmpty ? nil : author,
+                limit: 24
+            )
+            metadataCoverSearchResults = results
+            metadataSelectedCoverResultID = results.first?.id
+            if let first = results.first {
+                await setPendingCover(from: first.imageURL)
+            }
+            if results.isEmpty {
+                metadataEditorErrorMessage = "No Audible cover results found."
+            }
+        } catch {
+            metadataEditorErrorMessage = "Cover search failed: \(viewModel.describeError(error))"
+        }
+    }
+
+    private func setPendingCover(from url: URL) async {
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+                metadataEditorErrorMessage = "Cover image download failed."
+                return
+            }
+            guard let image = NSImage(data: data) else {
+                metadataEditorErrorMessage = "Downloaded cover image is invalid."
+                return
+            }
+            metadataPendingCoverData = data
+            metadataPendingCoverImage = image
+        } catch {
+            metadataEditorErrorMessage = "Cover image download failed: \(viewModel.describeError(error))"
+        }
+    }
+
+    private func applyCoverURLToPendingSelection() async {
+        let text = metadataCoverURLText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: text), ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+            metadataEditorErrorMessage = "Enter a valid HTTP(S) image URL."
+            return
+        }
+        await setPendingCover(from: url)
+    }
+
+    private func handleMetadataCoverImport(result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            do {
+                let data = try Data(contentsOf: url)
+                guard let image = NSImage(data: data) else {
+                    metadataEditorErrorMessage = "Selected file is not a valid image."
+                    return
+                }
+                metadataPendingCoverData = data
+                metadataPendingCoverImage = image
+            } catch {
+                metadataEditorErrorMessage = "Failed reading selected image: \(viewModel.describeError(error))"
+            }
+        case .failure(let error):
+            metadataEditorErrorMessage = "Cover import failed: \(viewModel.describeError(error))"
+        }
+    }
+
+    private func applySelectedCoverFromMetadataEditor() async {
+        guard let itemID = resolvedMetadataEditorItemID(),
+              let coverData = metadataPendingCoverData else { return }
+        metadataEditorBusy = true
+        defer { metadataEditorBusy = false }
+
+        do {
+            let didChange = try await viewModel.updateLocalItemCover(itemID: itemID, coverData: coverData)
+            if !didChange {
+                metadataEditorErrorMessage = "Selected cover is already applied."
+                return
+            }
+            if let image = NSImage(data: coverData) {
+                coverImagesByItemID[itemID] = image
+            }
+        } catch {
+            metadataEditorErrorMessage = "Failed applying cover: \(viewModel.describeError(error))"
         }
     }
 
@@ -3387,13 +3859,29 @@ struct ContentView: View {
         let stripPatterns = [
             #"(?i)\s*#\s*\d+\s*(,.*)?$"#,
             #"(?i)\s*\(\s*#\s*\d+\s*\)\s*$"#,
-            #"(?i)\s*,\s*book\s*\d+\s*$"#
+            #"(?i)\s*,\s*book\s*\d+\s*$"#,
+            // "Series Name 1: Book Title"
+            #"(?i)^(.+?)\s+\d+\s*:\s*.+$"#,
+            // "Series Name, Book 1: Book Title"
+            #"(?i)^(.+?)\s*,\s*book\s*\d+\s*:\s*.+$"#,
+            // "Series Name Book 1"
+            #"(?i)^(.+?)\s+book\s*\d+\s*$"#,
+            // "Series Name Vol 1"
+            #"(?i)^(.+?)\s+vol(?:ume)?\s*\d+\s*$"#
         ]
         for pattern in stripPatterns {
             guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
             let range = NSRange(value.startIndex..<value.endIndex, in: value)
-            value = regex.stringByReplacingMatches(in: value, options: [], range: range, withTemplate: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if pattern.contains("^(.+?)") {
+                if let match = regex.firstMatch(in: value, options: [], range: range),
+                   match.numberOfRanges > 1,
+                   let captured = Range(match.range(at: 1), in: value) {
+                    value = value[captured].trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            } else {
+                value = regex.stringByReplacingMatches(in: value, options: [], range: range, withTemplate: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
         }
 
         return value.isEmpty ? "Unknown Series" : value
@@ -4135,6 +4623,66 @@ struct ContentView: View {
 
     private func detailRow(title: String, value: String) -> some View {
         detailRow(title: title, value: value, multiline: false)
+    }
+
+    @ViewBuilder
+    private func editionBadge(for item: ABSCore.LibraryItem) -> some View {
+        switch editionVariant(for: item) {
+        case .dramatized:
+            Text("Dramatized")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(Color.orange.opacity(0.15))
+                )
+        case .standard:
+            Text("Standard")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(Color.secondary.opacity(0.12))
+                )
+        }
+    }
+
+    private enum EditionVariant {
+        case standard
+        case dramatized
+    }
+
+    private func editionVariant(for item: ABSCore.LibraryItem) -> EditionVariant {
+        let signals = [
+            item.title,
+            item.blurb ?? "",
+            preferredNarrator(for: item) ?? "",
+            item.author ?? "",
+            item.authors.joined(separator: " "),
+            item.tags.joined(separator: " "),
+            item.genres.joined(separator: " "),
+            item.collections.joined(separator: " ")
+        ].joined(separator: " ").lowercased()
+
+        let dramatizedCues = [
+            "dramatized",
+            "dramatised",
+            "dramatic adaptation",
+            "dramatized adaptation",
+            "audio drama",
+            "full cast",
+            "graphicaudio",
+            "graphic audio"
+        ]
+
+        if dramatizedCues.contains(where: { signals.contains($0) }) {
+            return .dramatized
+        }
+        return .standard
     }
 
     private func detailRow(title: String, value: String, multiline: Bool) -> some View {

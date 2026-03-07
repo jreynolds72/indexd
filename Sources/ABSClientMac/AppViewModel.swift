@@ -21,6 +21,15 @@ final class AppViewModel: ObservableObject {
         let publishedYear: Int?
     }
 
+    struct CoverSearchResult: Identifiable, Hashable, Sendable {
+        let id: String
+        let source: String
+        let asin: String?
+        let title: String
+        let authors: [String]
+        let imageURL: URL
+    }
+
     private enum DownloadFeatureError: LocalizedError {
         case unavailable
 
@@ -625,6 +634,103 @@ final class AppViewModel: ObservableObject {
         return changed
     }
 
+    func searchAudibleCovers(
+        title: String,
+        author: String?,
+        limit: Int = 20
+    ) async throws -> [CoverSearchResult] {
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else { return [] }
+        let trimmedAuthor = author?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var candidateASINs: [String] = []
+        if Self.isValidASIN(trimmedTitle) {
+            candidateASINs.append(trimmedTitle.uppercased())
+        } else {
+            var components = URLComponents(string: "https://api.audible.com/1.0/catalog/products")
+            var queryItems: [URLQueryItem] = [
+                URLQueryItem(name: "num_results", value: String(max(1, min(limit, 50)))),
+                URLQueryItem(name: "products_sort_by", value: "Relevance"),
+                URLQueryItem(name: "title", value: trimmedTitle)
+            ]
+            if let trimmedAuthor, !trimmedAuthor.isEmpty {
+                queryItems.append(URLQueryItem(name: "author", value: trimmedAuthor))
+            }
+            components?.queryItems = queryItems
+            guard let url = components?.url else { return [] }
+
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+                return []
+            }
+            let decoded = try JSONDecoder().decode(AudibleCoverCatalogResponse.self, from: data)
+            candidateASINs = (decoded.products ?? []).compactMap { $0.asin?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+        }
+
+        if candidateASINs.isEmpty { return [] }
+
+        let uniqueASINs = Array(Set(candidateASINs)).prefix(max(1, min(limit, 30)))
+        let audnexusBooks: [AudnexusBookResponse] = await withTaskGroup(of: AudnexusBookResponse?.self) { group in
+            for asin in uniqueASINs {
+                group.addTask {
+                    await self.fetchAudnexusBook(asin: asin, region: "us")
+                }
+            }
+            var collected: [AudnexusBookResponse] = []
+            for await result in group {
+                if let result {
+                    collected.append(result)
+                }
+            }
+            return collected
+        }
+
+        var seenImageURLs = Set<String>()
+        var results: [CoverSearchResult] = []
+        for book in audnexusBooks {
+            guard let image = book.image?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  let imageURL = URL(string: image),
+                  !image.isEmpty else {
+                continue
+            }
+            let dedupeKey = imageURL.absoluteString.lowercased()
+            guard seenImageURLs.insert(dedupeKey).inserted else { continue }
+            let title = (book.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { continue }
+            let authors = (book.authors ?? [])
+                .compactMap { $0.name?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+
+            results.append(
+                CoverSearchResult(
+                    id: book.asin ?? UUID().uuidString,
+                    source: "Audible",
+                    asin: book.asin,
+                    title: title,
+                    authors: authors,
+                    imageURL: imageURL
+                )
+            )
+        }
+        return results
+    }
+
+    @discardableResult
+    func updateLocalItemCover(itemID: String, coverData: Data?) async throws -> Bool {
+        guard let item = item(withID: itemID) else { return false }
+        guard let rootID = rootID(forLocalLibraryID: item.libraryID) else { return false }
+
+        let changed = try await localLibraryManager.updateItemCoverData(
+            rootID: rootID,
+            itemID: itemID,
+            coverData: coverData
+        )
+        if changed {
+            await refreshLocalLibraries()
+        }
+        return changed
+    }
+
     func addLocalLibraryRoot(directoryURL: URL) async throws {
         _ = try await localLibraryManager.addRoot(directoryURL: directoryURL)
         await refreshLocalLibraries()
@@ -675,11 +781,22 @@ final class AppViewModel: ObservableObject {
             options: organizationOptions
         )
 
-        return try await downloadItemToDirectory(
+        let destinationURL = try await downloadItemToDirectory(
             itemID: itemID,
             directoryURL: destinationDirectory,
             progress: progress
         )
+
+        if let sourceItem {
+            _ = try await localLibraryManager.ingestCopiedFile(
+                rootID: targetRootID,
+                fileURL: destinationURL,
+                sourceItem: sourceItem
+            )
+            await refreshLocalLibraries()
+        }
+
+        return destinationURL
     }
 
     func allKnownItems() -> [ABSCore.LibraryItem] {
@@ -892,8 +1009,12 @@ final class AppViewModel: ObservableObject {
     private func uniqueDestinationURL(in directory: URL, itemID: String, remoteURL: URL) -> URL {
         let ext = remoteURL.pathExtension.isEmpty ? "m4b" : remoteURL.pathExtension
         let fallbackName = "book-\(itemID)"
-        let title = item(withID: itemID)?.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let baseName = sanitizedFileName((title?.isEmpty == false ? title! : fallbackName))
+        let sourceItem = item(withID: itemID)
+        let title = sourceItem?.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        var baseName = sanitizedFileName((title?.isEmpty == false ? title! : fallbackName))
+        if let sourceItem, isDramatizedEdition(sourceItem), !titleContainsDramatizedCue(sourceItem.title) {
+            baseName = sanitizedFileName("\(baseName) (Dramatized)")
+        }
 
         var candidate = directory.appendingPathComponent("\(baseName).\(ext)")
         var attempt = 2
@@ -1003,6 +1124,39 @@ final class AppViewModel: ObservableObject {
         let components = value.components(separatedBy: invalid)
         let joined = components.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         return joined.isEmpty ? "download" : joined
+    }
+
+    private func isDramatizedEdition(_ item: ABSCore.LibraryItem) -> Bool {
+        let signals = [
+            item.title,
+            item.blurb ?? "",
+            item.narrator ?? "",
+            item.author ?? "",
+            item.authors.joined(separator: " "),
+            item.tags.joined(separator: " "),
+            item.genres.joined(separator: " "),
+            item.collections.joined(separator: " ")
+        ].joined(separator: " ").lowercased()
+
+        let cues = [
+            "dramatized",
+            "dramatised",
+            "dramatic adaptation",
+            "dramatized adaptation",
+            "audio drama",
+            "full cast",
+            "graphicaudio",
+            "graphic audio"
+        ]
+        return cues.contains(where: { signals.contains($0) })
+    }
+
+    private func titleContainsDramatizedCue(_ title: String) -> Bool {
+        let normalized = title.lowercased()
+        return normalized.contains("dramatized")
+            || normalized.contains("dramatised")
+            || normalized.contains("adaptation")
+            || normalized.contains("full cast")
     }
 
     private func mergeDetailedItem(_ detailed: ABSCore.LibraryItem) {
@@ -1335,6 +1489,51 @@ final class AppViewModel: ObservableObject {
 
         return error.localizedDescription
     }
+
+    private func fetchAudnexusBook(asin: String, region: String) async -> AudnexusBookResponse? {
+        var components = URLComponents(string: "https://api.audnex.us/books/\(asin)")
+        components?.queryItems = [URLQueryItem(name: "region", value: region)]
+        guard let url = components?.url else { return nil }
+
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+                return nil
+            }
+            return try JSONDecoder().decode(AudnexusBookResponse.self, from: data)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func isValidASIN(_ value: String) -> Bool {
+        let upper = value.uppercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard upper.count == 10 else { return false }
+        return upper.allSatisfy { $0.isASCII && ($0.isNumber || ($0 >= "A" && $0 <= "Z")) }
+    }
+}
+
+private struct AudibleCoverCatalogResponse: Decodable {
+    struct Contributor: Decodable {
+        let name: String?
+    }
+
+    struct Product: Decodable {
+        let asin: String?
+    }
+
+    let products: [Product]?
+}
+
+private struct AudnexusBookResponse: Decodable {
+    struct Contributor: Decodable {
+        let name: String?
+    }
+
+    let asin: String?
+    let title: String?
+    let authors: [Contributor]?
+    let image: String?
 }
 
 private struct APIProgressRemote: ProgressRemoteSyncing {

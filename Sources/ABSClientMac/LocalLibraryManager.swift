@@ -195,6 +195,90 @@ actor LocalLibraryManager {
     }
 
     @discardableResult
+    func ingestCopiedFile(
+        rootID: String,
+        fileURL: URL,
+        sourceItem: ABSCore.LibraryItem
+    ) async throws -> Bool {
+        guard state.roots.contains(where: { $0.id == rootID }) else {
+            return false
+        }
+        let standardizedFileURL = fileURL.standardizedFileURL
+        guard fileManager.fileExists(atPath: standardizedFileURL.path) else {
+            return false
+        }
+
+        let metadata = await extractMetadata(from: standardizedFileURL)
+        let fallbackTitle = standardizedFileURL.deletingPathExtension().lastPathComponent
+        let extractedTitle = metadata.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let localLibraryID = Self.libraryIDPrefix + rootID
+        let itemID = "local-item:\(Self.hash(standardizedFileURL.path))"
+
+        let scannedBaseline = ABSCore.LibraryItem(
+            id: itemID,
+            title: (extractedTitle?.isEmpty == false) ? extractedTitle! : fallbackTitle,
+            author: metadata.author,
+            authors: metadata.authors,
+            narrator: metadata.narrator,
+            seriesName: metadata.seriesName,
+            seriesSequence: metadata.seriesSequence,
+            collections: [],
+            genres: [],
+            tags: [],
+            blurb: nil,
+            publisher: nil,
+            publishedYear: nil,
+            language: nil,
+            libraryID: localLibraryID,
+            duration: metadata.duration,
+            chapters: metadata.chapters
+        )
+
+        let overlaid = ABSCore.LibraryItem(
+            id: itemID,
+            title: preferredTitle(primary: sourceItem.title, fallback: scannedBaseline.title),
+            author: preferredScalar(sourceItem.author, fallback: scannedBaseline.author ?? sourceItem.authors.first),
+            authors: sourceItem.authors.isEmpty ? scannedBaseline.authors : sourceItem.authors,
+            narrator: preferredScalar(sourceItem.narrator, fallback: scannedBaseline.narrator),
+            seriesName: preferredScalar(sourceItem.seriesName, fallback: scannedBaseline.seriesName),
+            seriesSequence: sourceItem.seriesSequence ?? scannedBaseline.seriesSequence,
+            collections: sourceItem.collections,
+            genres: sourceItem.genres,
+            tags: sourceItem.tags,
+            blurb: preferredScalar(sourceItem.blurb, fallback: scannedBaseline.blurb),
+            publisher: preferredScalar(sourceItem.publisher, fallback: scannedBaseline.publisher),
+            publishedYear: sourceItem.publishedYear ?? scannedBaseline.publishedYear,
+            language: preferredScalar(sourceItem.language, fallback: scannedBaseline.language),
+            libraryID: localLibraryID,
+            duration: sourceItem.duration ?? scannedBaseline.duration,
+            chapters: sourceItem.chapters.isEmpty ? scannedBaseline.chapters : sourceItem.chapters
+        )
+
+        var items = state.itemsByRootID[rootID] ?? []
+        if let index = items.firstIndex(where: { $0.primaryFilePath == standardizedFileURL.path || $0.item.id == itemID }) {
+            let existing = items[index]
+            let merged = mergedScannedItem(existing: existing.item, scanned: overlaid)
+            items[index] = PersistedItem(
+                item: merged,
+                primaryFilePath: standardizedFileURL.path,
+                coverData: existing.coverData ?? metadata.coverData
+            )
+        } else {
+            items.append(
+                PersistedItem(
+                    item: overlaid,
+                    primaryFilePath: standardizedFileURL.path,
+                    coverData: metadata.coverData
+                )
+            )
+        }
+
+        state.itemsByRootID[rootID] = items.sorted { $0.item.title.localizedCaseInsensitiveCompare($1.item.title) == .orderedAscending }
+        try persist()
+        return true
+    }
+
+    @discardableResult
     func applyMetadataCandidate(
         rootID: String,
         itemID: String,
@@ -251,6 +335,36 @@ actor LocalLibraryManager {
         return true
     }
 
+    @discardableResult
+    func updateItemCoverData(
+        rootID: String,
+        itemID: String,
+        coverData: Data?
+    ) throws -> Bool {
+        guard var items = state.itemsByRootID[rootID] else {
+            return false
+        }
+        guard let itemIndex = items.firstIndex(where: { $0.item.id == itemID }) else {
+            return false
+        }
+
+        let existingRecord = items[itemIndex]
+        let existingCover = existingRecord.coverData ?? Data()
+        let incomingCover = coverData ?? Data()
+        guard existingCover != incomingCover else {
+            return false
+        }
+
+        items[itemIndex] = PersistedItem(
+            item: existingRecord.item,
+            primaryFilePath: existingRecord.primaryFilePath,
+            coverData: coverData
+        )
+        state.itemsByRootID[rootID] = items
+        try persist()
+        return true
+    }
+
     private func scanRoot(_ root: PersistedRoot) async throws -> [PersistedItem] {
         let rootURL = URL(fileURLWithPath: root.directoryPath, isDirectory: true)
         guard fileManager.fileExists(atPath: rootURL.path) else {
@@ -269,6 +383,9 @@ actor LocalLibraryManager {
         )
 
         var persistedItems: [PersistedItem] = []
+        let existingByPath = Dictionary(
+            uniqueKeysWithValues: (state.itemsByRootID[root.id] ?? []).map { ($0.primaryFilePath, $0) }
+        )
 
         for (groupKey, files) in grouped {
             guard let primary = files.max(by: { Self.fileSize(of: $0, fileManager: fileManager) < Self.fileSize(of: $1, fileManager: fileManager) }) else {
@@ -309,11 +426,15 @@ actor LocalLibraryManager {
                 chapters: metadata.chapters
             )
 
+            let mergedItem = existingByPath[primary.path].map { existing in
+                mergedScannedItem(existing: existing.item, scanned: item)
+            } ?? item
+
             persistedItems.append(
                 PersistedItem(
-                    item: item,
+                    item: mergedItem,
                     primaryFilePath: primary.path,
-                    coverData: metadata.coverData
+                    coverData: existingByPath[primary.path]?.coverData ?? metadata.coverData
                 )
             )
         }
@@ -455,6 +576,37 @@ actor LocalLibraryManager {
             return (name.isEmpty ? value : name, sequence)
         }
 
+        let patterns: [String] = [
+            // "Series Name 1: Book Title"
+            #"(?i)^\s*(.+?)\s+(\d+)\s*:\s*.+$"#,
+            // "Series Name, Book 1: Book Title"
+            #"(?i)^\s*(.+?)\s*,\s*book\s+(\d+)\s*:\s*.+$"#,
+            // "Series Name Book 1"
+            #"(?i)^\s*(.+?)\s+book\s+(\d+)\s*$"#,
+            // "Series Name Vol 1"
+            #"(?i)^\s*(.+?)\s+vol(?:ume)?\s+(\d+)\s*$"#
+        ]
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(value.startIndex..<value.endIndex, in: value)
+            guard let match = regex.firstMatch(in: value, options: [], range: range), match.numberOfRanges > 2 else {
+                continue
+            }
+            let name: String? = {
+                guard let r = Range(match.range(at: 1), in: value) else { return nil }
+                let parsed = value[r].trimmingCharacters(in: .whitespacesAndNewlines)
+                return parsed.isEmpty ? nil : parsed
+            }()
+            let sequence: Int? = {
+                guard let r = Range(match.range(at: 2), in: value) else { return nil }
+                return Int(value[r])
+            }()
+            if let name {
+                return (name, sequence)
+            }
+        }
+
         return (value, nil)
     }
 
@@ -497,21 +649,36 @@ actor LocalLibraryManager {
     }
 
     private func mergedItem(existing: ABSCore.LibraryItem, candidate: MetadataMatchCandidate) -> ABSCore.LibraryItem {
-        ABSCore.LibraryItem(
+        let candidateTitle = candidate.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedTitle = candidateTitle.isEmpty ? existing.title : candidateTitle
+        let resolvedAuthors = candidate.authors
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let resolvedAuthor = resolvedAuthors.first
+        let resolvedNarrator = candidate.narrator?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedSeries = candidate.seriesName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedCollections = normalizedList(candidate.collections)
+        let resolvedGenres = normalizedList(candidate.genres)
+        let resolvedTags = normalizedList(candidate.tags)
+        let resolvedBlurb = candidate.blurb?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedPublisher = candidate.publisher?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedLanguage = candidate.language?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return ABSCore.LibraryItem(
             id: existing.id,
-            title: shouldReplaceScalar(existing.title) ? candidate.title : existing.title,
-            author: mergeScalar(existing.author, fallback: candidate.authors.first),
-            authors: mergeArray(existing.authors, fallback: candidate.authors),
-            narrator: mergeScalar(existing.narrator, fallback: candidate.narrator),
-            seriesName: mergeScalar(existing.seriesName, fallback: candidate.seriesName),
-            seriesSequence: existing.seriesSequence ?? candidate.seriesSequence,
-            collections: mergeArray(existing.collections, fallback: candidate.collections),
-            genres: mergeArray(existing.genres, fallback: candidate.genres),
-            tags: mergeArray(existing.tags, fallback: candidate.tags),
-            blurb: mergeScalar(existing.blurb, fallback: candidate.blurb),
-            publisher: mergeScalar(existing.publisher, fallback: candidate.publisher),
-            publishedYear: existing.publishedYear ?? candidate.publishedYear,
-            language: mergeScalar(existing.language, fallback: candidate.language),
+            title: resolvedTitle,
+            author: resolvedAuthor,
+            authors: resolvedAuthors,
+            narrator: resolvedNarrator?.isEmpty == false ? resolvedNarrator : nil,
+            seriesName: resolvedSeries?.isEmpty == false ? resolvedSeries : nil,
+            seriesSequence: candidate.seriesSequence,
+            collections: resolvedCollections,
+            genres: resolvedGenres,
+            tags: resolvedTags,
+            blurb: resolvedBlurb?.isEmpty == false ? resolvedBlurb : nil,
+            publisher: resolvedPublisher?.isEmpty == false ? resolvedPublisher : nil,
+            publishedYear: candidate.publishedYear,
+            language: resolvedLanguage?.isEmpty == false ? resolvedLanguage : nil,
             libraryID: existing.libraryID,
             duration: existing.duration,
             chapters: existing.chapters
@@ -545,5 +712,60 @@ actor LocalLibraryManager {
             }
         }
         return merged
+    }
+
+    private func normalizedList(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for raw in values {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let key = trimmed.lowercased()
+            if seen.insert(key).inserted {
+                result.append(trimmed)
+            }
+        }
+        return result
+    }
+
+    private func preferredScalar(_ primary: String?, fallback: String?) -> String? {
+        if let primary, !primary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return primary.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let fallback, !fallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return fallback.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return nil
+    }
+
+    private func preferredTitle(primary: String, fallback: String) -> String {
+        let trimmedPrimary = primary.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedPrimary.isEmpty, trimmedPrimary.caseInsensitiveCompare("Unknown Title") != .orderedSame {
+            return trimmedPrimary
+        }
+        let trimmedFallback = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedFallback.isEmpty ? "Unknown Title" : trimmedFallback
+    }
+
+    private func mergedScannedItem(existing: ABSCore.LibraryItem, scanned: ABSCore.LibraryItem) -> ABSCore.LibraryItem {
+        ABSCore.LibraryItem(
+            id: scanned.id,
+            title: shouldReplaceScalar(existing.title) ? scanned.title : existing.title,
+            author: mergeScalar(existing.author, fallback: scanned.author),
+            authors: mergeArray(existing.authors, fallback: scanned.authors),
+            narrator: mergeScalar(existing.narrator, fallback: scanned.narrator),
+            seriesName: mergeScalar(existing.seriesName, fallback: scanned.seriesName),
+            seriesSequence: existing.seriesSequence ?? scanned.seriesSequence,
+            collections: mergeArray(existing.collections, fallback: scanned.collections),
+            genres: mergeArray(existing.genres, fallback: scanned.genres),
+            tags: mergeArray(existing.tags, fallback: scanned.tags),
+            blurb: mergeScalar(existing.blurb, fallback: scanned.blurb),
+            publisher: mergeScalar(existing.publisher, fallback: scanned.publisher),
+            publishedYear: existing.publishedYear ?? scanned.publishedYear,
+            language: mergeScalar(existing.language, fallback: scanned.language),
+            libraryID: scanned.libraryID,
+            duration: scanned.duration ?? existing.duration,
+            chapters: scanned.chapters.isEmpty ? existing.chapters : scanned.chapters
+        )
     }
 }

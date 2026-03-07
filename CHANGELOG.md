@@ -6,6 +6,37 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.1.0-beta.5] - 2026-03-06
+
+### Added
+- Local metadata matching and reconciliation workflow:
+  - Per-book metadata editor from item actions.
+  - Match actions and reconciliation support for local-library metadata updates.
+- Local library auto-refresh via file-system watching:
+  - Monitors library folders (including subfolders) for changes.
+  - Triggers automatic library updates when new or changed items are detected.
+- Local library file-organization settings:
+  - Template-based organization under library root (for example `Author/Series/Book`).
+  - Unmatched-item fallback handling for organization workflows.
+
+### Changed
+- Local-library context actions now open the configured local library root in Finder.
+- Local-library menu labeling was clarified to reduce confusion with remote download wording.
+- README release instructions were simplified by removing outdated notarization references.
+
+### Fixed
+- Multi-item copy to local library was hardened to avoid follow-on failures in queued operations.
+- Series normalization now strips ABS-style trailing sequence suffixes (for example `Series #1`) during folder resolution to prevent duplicate per-book series directories.
+
+### Commits Since 0.1.0-beta.4
+- `34f9884` feat(local): add metadata matching workflow and reconciliation notes (#27)
+- `c9b21c2` feat(local): watch local library folders and auto-refresh on changes
+- `42076f9` fix(local): open selected local library root in Finder and relabel menu
+- `20758df` fix(copy): make multi-copy resilient to library context changes
+- `aed4e9a` feat(local): add template-based local file organization settings
+- `91a046a` fix(local): normalize ABS series suffix when resolving folder template
+- `f94c268` Remove notarization instructions from README
+
 ## [0.1.0-beta.4] - 2026-03-04
 
 ### Added

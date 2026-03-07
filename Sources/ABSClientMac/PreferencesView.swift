@@ -249,7 +249,7 @@ struct PreferencesView: View {
                                     showMetadataMatchOptIn = true
                                 }
                                 .disabled(localLibraryLoading || localLibraryRescanInProgress || metadataMatchInProgress)
-                                .help("Find metadata matches from OpenLibrary. You review confidence and approve before apply.")
+                                .help("Find metadata matches from online providers. You review confidence and approve before apply.")
                             }
                         }
                         .padding(.vertical, 4)
@@ -276,7 +276,7 @@ struct PreferencesView: View {
                 metadataMatchingRoot = nil
             }
         } message: {
-            Text("Metadata matching uses OpenLibrary search queries. Matches are scored and require your review before any changes are applied.")
+            Text("Metadata matching uses online provider search queries. Matches are scored and require your review before any changes are applied.")
         }
         .sheet(isPresented: $showMetadataMatchReview) {
             metadataMatchReviewSheet
@@ -329,7 +329,7 @@ struct PreferencesView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Metadata Review")
                         .font(.title3.bold())
-                    Text("Source: OpenLibrary • Non-destructive merge")
+                    Text("Source: Online providers • Non-destructive merge")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -374,7 +374,7 @@ struct PreferencesView: View {
 
                             Picker("Candidate", selection: $review.selectedCandidateID) {
                                 ForEach(review.candidates) { candidate in
-                                    Text("\(candidate.title) • \(Int((candidate.confidence * 100).rounded()))%")
+                                    Text("\(candidate.title)\(candidate.isExactRuntimeMatch ? " • Exact Match" : "") • \(Int((candidate.confidence * 100).rounded()))%")
                                         .tag(candidate.id)
                                 }
                             }
@@ -382,9 +382,16 @@ struct PreferencesView: View {
                             .pickerStyle(.menu)
 
                             if let selected = review.selectedCandidate {
-                                Text("\(selected.authors.joined(separator: ", ")) • \(selected.confidenceReason)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                HStack(spacing: 6) {
+                                    Text("\(selected.authors.joined(separator: ", ")) • \(selected.confidenceReason)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    if selected.isExactRuntimeMatch {
+                                        Text("Exact Match")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(.green)
+                                    }
+                                }
                             }
                         }
                         .padding(.vertical, 4)

@@ -6,7 +6,7 @@ Native macOS client for Audiobookshelf, built with SwiftUI and AVFoundation.
 
 indexd is currently in beta.
 
-- Latest release: `v0.1.0-beta.4`
+- Latest release: `v0.1.0-beta.5`
 - Changelog: [CHANGELOG.md](./CHANGELOG.md)
 
 ## Highlights
@@ -55,29 +55,29 @@ swift build -c release
 Create `.app` bundle:
 
 ```bash
-./scripts/package-app.sh 0.1.0-beta.4 1
+./scripts/package-app.sh 0.1.0-beta.5 1
 ```
 
 Generated artifacts:
 
 - `dist/indexd.app`
-- `dist/indexd-macos-v0.1.0-beta.4.zip` (if zipped for release)
+- `dist/indexd-macos-v0.1.0-beta.5.zip` (if zipped for release)
 
 Create release zip:
 
 ```bash
-ditto -c -k --sequesterRsrc --keepParent dist/indexd.app dist/indexd-macos-v0.1.0-beta.4.zip
+ditto -c -k --sequesterRsrc --keepParent dist/indexd.app dist/indexd-macos-v0.1.0-beta.5.zip
 ```
 
 ## Release Process (Beta)
 
 ```bash
 git add .
-git commit -m "Release v0.1.0-beta.4"
-git tag v0.1.0-beta.4
+git commit -m "Release v0.1.0-beta.5"
+git tag v0.1.0-beta.5
 git push origin main
-git push origin v0.1.0-beta.4
-gh release create v0.1.0-beta.4 dist/indexd-macos-v0.1.0-beta.4.zip --prerelease
+git push origin v0.1.0-beta.5
+gh release create v0.1.0-beta.5 dist/indexd-macos-v0.1.0-beta.5.zip --prerelease
 ```
 
 ## Contributing and Security
