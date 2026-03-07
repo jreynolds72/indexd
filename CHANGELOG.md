@@ -9,9 +9,13 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 ## [0.1.0-beta.5] - 2026-03-06
 
 ### Added
-- Local metadata matching and reconciliation workflow:
-  - Per-book metadata editor from item actions.
-  - Match actions and reconciliation support for local-library metadata updates.
+- Per-book local metadata editor from item actions, with save/cancel flow.
+- Match workflows in metadata editor:
+  - Quick Match and manual `Match...` search.
+  - Re-Scan action and match-result preview before apply.
+  - Exact-match indicator when runtime is within 1% of local duration.
+- Multi-source metadata ranking support (Audible + Google Books providers).
+- Audible cover-search/selection workflow for local metadata cover updates.
 - Local library auto-refresh via file-system watching:
   - Monitors library folders (including subfolders) for changes.
   - Triggers automatic library updates when new or changed items are detected.
@@ -22,13 +26,26 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 ### Changed
 - Local-library context actions now open the configured local library root in Finder.
 - Local-library menu labeling was clarified to reduce confusion with remote download wording.
+- Copy-to-local ingest now routes copied files through local-library ingest/organization paths.
+- Download/copy filename generation now preserves dramatized-edition cues in output names.
 - README release instructions were simplified by removing outdated notarization references.
 
 ### Fixed
 - Multi-item copy to local library was hardened to avoid follow-on failures in queued operations.
 - Series normalization now strips ABS-style trailing sequence suffixes (for example `Series #1`) during folder resolution to prevent duplicate per-book series directories.
+- Metadata editor fixes:
+  - Preserve selected item context for match/save.
+  - Keep match actions visible in editor footer.
+  - Present manual match sheet while editor is open.
 
 ### Commits Since 0.1.0-beta.4
+- `bc65ef6` feat(metadata): finalize matching and cover workflows for beta.5
+- `a813da6` feat(match): add Google Books provider and weighted multi-source ranking
+- `609f663` fix(metadata): present manual match sheet from metadata editor
+- `f013d1f` fix(metadata): always show match actions in editor footer
+- `8c0bfe0` feat(metadata): add cancel and manual match dialog alongside quick match
+- `45ef9a0` fix(metadata): preserve editor item context for quick match/save
+- `fb76839` feat(local): add per-book metadata editor with quick match actions
 - `34f9884` feat(local): add metadata matching workflow and reconciliation notes (#27)
 - `c9b21c2` feat(local): watch local library folders and auto-refresh on changes
 - `42076f9` fix(local): open selected local library root in Finder and relabel menu
