@@ -446,21 +446,34 @@ struct ContentView: View {
         var view = AnyView(
             GeometryReader { geometry in
                 VStack(spacing: 0) {
-                    NavigationSplitView(columnVisibility: homeAwareSplitVisibility) {
-                        sidebarView
-                    } content: {
-                        itemListView
-                    } detail: {
-                        if currentBrowseTab == .home {
-                            EmptyView()
+                    if currentBrowseTab == .home {
+                        // Home is intentionally rendered as "sidebar + main content".
+                        // We route main content through the detail column and clamp
+                        // the middle column to 1pt to avoid a visible right blank panel
+                        // during resize state transitions.
+                        NavigationSplitView(columnVisibility: .constant(.all)) {
+                            sidebarView
+                        } content: {
+                            Color.clear
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
                                 .navigationSplitViewColumnWidth(min: 1, ideal: 1, max: 1)
-                        } else {
+                        } detail: {
+                            itemListView
+                        }
+                        .navigationSplitViewStyle(.balanced)
+                        .animation(.easeInOut(duration: 0.24), value: showingNowPlaying)
+                    } else {
+                        NavigationSplitView(columnVisibility: $splitVisibility) {
+                            sidebarView
+                        } content: {
+                            itemListView
+                        } detail: {
                             detailView
                                 .navigationSplitViewColumnWidth(min: 390, ideal: 430, max: 640)
                         }
+                        .navigationSplitViewStyle(.balanced)
+                        .animation(.easeInOut(duration: 0.24), value: showingNowPlaying)
                     }
-                    .navigationSplitViewStyle(.balanced)
-                    .animation(.easeInOut(duration: 0.24), value: showingNowPlaying)
 
                     Divider()
 
@@ -5278,19 +5291,6 @@ struct ContentView: View {
 
     private func applySplitVisibilityForCurrentTab() {
         updateSplitVisibility(for: currentWindowWidth)
-    }
-
-    private var homeAwareSplitVisibility: Binding<NavigationSplitViewVisibility> {
-        Binding(
-            get: { currentBrowseTab == .home ? .all : splitVisibility },
-            set: { newValue in
-                if currentBrowseTab == .home {
-                    splitVisibility = .all
-                } else {
-                    splitVisibility = newValue
-                }
-            }
-        )
     }
 
     private func configurePlayerObservers() {
