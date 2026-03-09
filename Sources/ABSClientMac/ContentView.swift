@@ -453,7 +453,7 @@ struct ContentView: View {
                     } detail: {
                         if currentBrowseTab == .home {
                             EmptyView()
-                                .navigationSplitViewColumnWidth(min: 0, ideal: 0, max: 0)
+                                .navigationSplitViewColumnWidth(min: 1, ideal: 1, max: 1)
                         } else {
                             detailView
                                 .navigationSplitViewColumnWidth(min: 390, ideal: 430, max: 640)
