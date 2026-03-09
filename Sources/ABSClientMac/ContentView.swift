@@ -160,6 +160,7 @@ struct ContentView: View {
     }
 
     private enum LibraryBrowseTab: String {
+        case home = "Home"
         case authors = "Authors"
         case narrators = "Narrators"
         case series = "Series"
@@ -294,6 +295,11 @@ struct ContentView: View {
         var publishedYearText: String
     }
 
+    private struct LocalServerUploadDraft {
+        var title: String
+        var author: String
+    }
+
     private enum MetadataEditorTab: String, CaseIterable, Identifiable {
         case details = "Details"
         case cover = "Cover"
@@ -309,6 +315,7 @@ struct ContentView: View {
     private let searchSuggestionLimit = 5
     private let downloadMenuPageSize = 8
     private let libraryBrowseTabs: [LibraryBrowseTab] = [
+        .home,
         .authors,
         .narrators,
         .series,
@@ -365,6 +372,7 @@ struct ContentView: View {
     @State private var favoriteItemIDs: Set<String> = []
     @State private var recentActivityByItemID: [String: Date] = [:]
     @State private var downloadedItemIDs: Set<String> = []
+    @State private var downloadedAtByItemID: [String: Date] = [:]
     @State private var downloadStateByItemID: [String: DownloadState] = [:]
     @State private var downloadBusyItemIDs: Set<String> = []
     @State private var downloadQueuedItemIDs: Set<String> = []
@@ -411,6 +419,19 @@ struct ContentView: View {
     @State private var manualMetadataMatchCandidates: [MetadataMatchCandidate] = []
     @State private var manualMetadataMatchSelectedCandidateID: String?
     @State private var manualMetadataMatchBusy = false
+    @State private var showingLocalServerUploadPreview = false
+    @State private var localServerUploadItemID: String?
+    @State private var localServerUploadDraft = LocalServerUploadDraft(title: "", author: "")
+    @State private var localServerUploadLibraries: [ABSCore.Library] = []
+    @State private var localServerSelectedLibraryID: String?
+    @State private var localServerUploadFolders: [ABSCore.LibraryFolder] = []
+    @State private var localServerSelectedFolderID: String?
+    @State private var localServerUploadBusy = false
+    @State private var localServerUploadFolderLoading = false
+    @State private var localServerUploadDuplicateBusy = false
+    @State private var localServerDuplicateMatches: [AppViewModel.RemoteUploadDuplicate] = []
+    @State private var showingLocalServerDuplicateWarning = false
+    @State private var localServerUploadErrorMessage: String?
     @State private var isTimelineScrubbing = false
     @State private var scrubPreviewSeconds: TimeInterval?
     @State private var progressHydrationTask: Task<Void, Never>?
@@ -418,18 +439,25 @@ struct ContentView: View {
     @State private var lastLiveUpdateAt: Date?
     @State private var statsScope: StatsScope = .currentLibrary
     @State private var hasAttemptedDownloadRecovery = false
+    @State private var homeHoveredItemID: String?
+    @State private var currentWindowWidth: CGFloat = 1200
 
     var body: some View {
         var view = AnyView(
             GeometryReader { geometry in
                 VStack(spacing: 0) {
-                    NavigationSplitView(columnVisibility: $splitVisibility) {
+                    NavigationSplitView(columnVisibility: homeAwareSplitVisibility) {
                         sidebarView
                     } content: {
                         itemListView
                     } detail: {
-                        detailView
-                            .navigationSplitViewColumnWidth(min: 390, ideal: 430, max: 640)
+                        if currentBrowseTab == .home {
+                            EmptyView()
+                                .navigationSplitViewColumnWidth(min: 0, ideal: 0, max: 0)
+                        } else {
+                            detailView
+                                .navigationSplitViewColumnWidth(min: 390, ideal: 430, max: 640)
+                        }
                     }
                     .navigationSplitViewStyle(.balanced)
                     .animation(.easeInOut(duration: 0.24), value: showingNowPlaying)
@@ -632,6 +660,10 @@ struct ContentView: View {
             metadataEditorSheet
         })
 
+        view = AnyView(view.sheet(isPresented: $showingLocalServerUploadPreview) {
+            localServerUploadPreviewSheet
+        })
+
         view = AnyView(view.task {
             await viewModel.bootstrap()
             loadLocalPlaybackMetadata()
@@ -642,15 +674,10 @@ struct ContentView: View {
                 viewModel.selectedLibraryID = viewModel.libraries.first?.id
             }
             if let selectedLibraryID = viewModel.selectedLibraryID, browseTabByLibraryID[selectedLibraryID] == nil {
-                browseTabByLibraryID[selectedLibraryID] = .books
+                browseTabByLibraryID[selectedLibraryID] = .home
             }
-            if isBookListTab {
-                selectedItemID = browsedItems.first?.id
-                selectedGroupID = nil
-            } else {
-                selectedGroupID = displayedBrowseGroups.first?.id
-                selectedItemID = nil
-            }
+            applySplitVisibilityForCurrentTab()
+            refreshSelectionForCurrentBrowseContext()
             configurePlayerObservers()
             configureKeyboardMonitor()
             updateNowPlaying()
@@ -702,13 +729,8 @@ struct ContentView: View {
         })
 
         view = AnyView(view.onChange(of: viewModel.selectedLibraryID, perform: { _ in
-            if isBookListTab {
-                selectedItemID = browsedItems.first?.id
-                selectedGroupID = nil
-            } else {
-                selectedGroupID = displayedBrowseGroups.first?.id
-                selectedItemID = nil
-            }
+            applySplitVisibilityForCurrentTab()
+            refreshSelectionForCurrentBrowseContext()
             elapsedSeconds = 0
             isPlaying = false
             updateNowPlaying()
@@ -1039,24 +1061,30 @@ struct ContentView: View {
 
     private var itemListHeader: some View {
         HStack(spacing: 12) {
-            if currentBrowseTab == .stats {
+            if currentBrowseTab == .stats || currentBrowseTab == .home {
                 HStack(spacing: 6) {
-                    Text("Scope")
-                        .foregroundStyle(.secondary)
-                    Picker("Scope", selection: $statsScope) {
-                        ForEach(StatsScope.allCases) { scope in
-                            Text(scope.rawValue).tag(scope)
+                    if currentBrowseTab == .stats {
+                        Text("Scope")
+                            .foregroundStyle(.secondary)
+                        Picker("Scope", selection: $statsScope) {
+                            ForEach(StatsScope.allCases) { scope in
+                                Text(scope.rawValue).tag(scope)
+                            }
                         }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                    } else {
+                        Text("Home highlights")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
                     }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
                 }
 
-                if let statsLastUpdatedAt {
+                if currentBrowseTab == .stats, let statsLastUpdatedAt {
                     Text("Last updated: \(formattedSyncTimestamp(statsLastUpdatedAt))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                } else {
+                } else if currentBrowseTab == .stats {
                     Text("Last updated: Pending")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -1189,10 +1217,122 @@ struct ContentView: View {
     private var itemListContent: some View {
         if currentBrowseTab == .stats {
             statsListView
+        } else if currentBrowseTab == .home {
+            homeCoverFlowView
         } else if isBookListTab {
             booksListView
         } else {
             groupListView
+        }
+    }
+
+    private var homeCoverFlowView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                ForEach(displayedBrowseGroups) { group in
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text(group.title)
+                                .font(.title2.weight(.semibold))
+                            Spacer()
+                            Text("\(group.itemCount) books")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        if let subtitle = group.subtitle, !subtitle.isEmpty {
+                            Text(subtitle)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        if group.items.isEmpty {
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(Color.secondary.opacity(0.08))
+                                .overlay {
+                                    Text("No items")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(height: 96)
+                        } else {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                LazyHStack(alignment: .top, spacing: 14) {
+                                    ForEach(group.items) { item in
+                                        homeCoverCard(item)
+                                    }
+                                }
+                                .padding(.vertical, 4)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 14)
+        }
+    }
+
+    private func homeCoverCard(_ item: ABSCore.LibraryItem) -> some View {
+        let isHovered = homeHoveredItemID == item.id
+        return VStack(alignment: .leading, spacing: 6) {
+            ZStack {
+                Group {
+                    if let cover = coverImagesByItemID[item.id] {
+                        Image(nsImage: cover)
+                            .resizable()
+                            .scaledToFill()
+                    } else {
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(LinearGradient(colors: [.indigo.opacity(0.6), .orange.opacity(0.35)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                            .overlay {
+                                Image(systemName: "book.closed.fill")
+                                    .font(.system(size: 26, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.85))
+                            }
+                            .onAppear {
+                                Task { await preloadCoverForItemID(item.id) }
+                            }
+                    }
+                }
+                .frame(width: 146, height: 146)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                if isHovered {
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.black.opacity(0.38))
+                        .frame(width: 146, height: 146)
+                    Image(systemName: "play.fill")
+                        .font(.title2.weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(12)
+                        .background(Circle().fill(Color.black.opacity(0.45)))
+                }
+            }
+            .frame(width: 146, height: 146)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+
+            Text(item.title)
+                .font(.caption.weight(.semibold))
+                .lineLimit(2)
+                .frame(width: 146, alignment: .leading)
+            Text(displayAuthorNames(for: item).joined(separator: ", "))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(width: 146, alignment: .leading)
+        }
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            homeHoveredItemID = hovering ? item.id : (homeHoveredItemID == item.id ? nil : homeHoveredItemID)
+        }
+        .onTapGesture {
+            selectedItemID = item.id
+            selectedItemIDs = [item.id]
+            let resumePosition = savedProgress(for: item.id)
+            play(item: item, startPosition: resumePosition > 0 ? resumePosition : nil)
+        }
+        .contextMenu {
+            singleItemContextMenu(item: item)
         }
     }
 
@@ -1271,79 +1411,7 @@ struct ContentView: View {
                         Task { await setPlayedState(for: contextItemIDs, isPlayed: false) }
                     }
                 } else {
-                    Button("Start from Beginning") {
-                        selectedItemID = item.id
-                        selectedItemIDs = [item.id]
-                        play(item: item, startPosition: 0, forceReload: true)
-                    }
-
-                    if hasSavedProgress(for: item.id) {
-                        let resumePosition = savedProgress(for: item.id)
-                        Button("Resume at \(formattedClock(resumePosition))") {
-                            selectedItemID = item.id
-                            selectedItemIDs = [item.id]
-                            play(item: item, startPosition: resumePosition)
-                        }
-                    }
-
-                    Divider()
-
-                    Button(favoriteItemIDs.contains(item.id) ? "Unfavorite" : "Favorite") {
-                        toggleFavorite(itemID: item.id)
-                    }
-
-                    Button("Clear Progress") {
-                        clearSavedProgressEverywhere(item: item)
-                    }
-                    .disabled(!hasSavedProgress(for: item.id))
-
-                    if isMarkedPlayed(itemID: item.id, duration: item.duration) {
-                        Button("Mark Unplayed") {
-                            Task { await setPlayedState(for: [item.id], isPlayed: false) }
-                        }
-                    } else {
-                        Button("Mark Played") {
-                            Task { await setPlayedState(for: [item.id], isPlayed: true) }
-                        }
-                    }
-
-                    Divider()
-
-                    Button("Edit Metadata…") {
-                        openMetadataEditor(for: item.id)
-                    }
-                    .disabled(!viewModel.canEditMetadata(itemID: item.id))
-
-                    Divider()
-
-                    Menu(downloadMenuTitle) {
-                        Button(downloadBusyItemIDs.contains(item.id) ? "Downloading to App Cache…" : "Download to App Cache") {
-                            Task { await downloadItem(item.id) }
-                        }
-                        .disabled(downloadBusyItemIDs.contains(item.id))
-
-                        Button("Download To…") {
-                            Task { await downloadItemToChosenLocation(item: item) }
-                        }
-                        .disabled(downloadBusyItemIDs.contains(item.id))
-
-                        Button(openLibraryFolderActionTitle) {
-                            Task { await openPreferredLibraryFolderInFinder() }
-                        }
-
-                        if downloadState(for: item.id) == .downloaded {
-                            Divider()
-                            Button("Remove Downloaded File", role: .destructive) {
-                                Task { await removeDownload(for: item.id) }
-                            }
-                        }
-                    }
-
-                    if canCopyToLocalLibrary {
-                        Button("Copy to Local Library") {
-                            Task { await copyItemsToLocalLibrary([item.id]) }
-                        }
-                    }
+                    singleItemContextMenu(item: item)
                 }
             }
             .onTapGesture(count: 2) {
@@ -1351,6 +1419,89 @@ struct ContentView: View {
                 selectedItemIDs = [item.id]
                 let resumePosition = savedProgress(for: item.id)
                 play(item: item, startPosition: resumePosition > 0 ? resumePosition : nil)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func singleItemContextMenu(item: ABSCore.LibraryItem) -> some View {
+        Button("Start from Beginning") {
+            selectedItemID = item.id
+            selectedItemIDs = [item.id]
+            play(item: item, startPosition: 0, forceReload: true)
+        }
+
+        if hasSavedProgress(for: item.id) {
+            let resumePosition = savedProgress(for: item.id)
+            Button("Resume at \(formattedClock(resumePosition))") {
+                selectedItemID = item.id
+                selectedItemIDs = [item.id]
+                play(item: item, startPosition: resumePosition)
+            }
+        }
+
+        Divider()
+
+        Button(favoriteItemIDs.contains(item.id) ? "Unfavorite" : "Favorite") {
+            toggleFavorite(itemID: item.id)
+        }
+
+        Button("Clear Progress") {
+            clearSavedProgressEverywhere(item: item)
+        }
+        .disabled(!hasSavedProgress(for: item.id))
+
+        if isMarkedPlayed(itemID: item.id, duration: item.duration) {
+            Button("Mark Unplayed") {
+                Task { await setPlayedState(for: [item.id], isPlayed: false) }
+            }
+        } else {
+            Button("Mark Played") {
+                Task { await setPlayedState(for: [item.id], isPlayed: true) }
+            }
+        }
+
+        Divider()
+
+        Button("Edit Metadata…") {
+            openMetadataEditor(for: item.id)
+        }
+        .disabled(!viewModel.canEditMetadata(itemID: item.id))
+
+        Divider()
+
+        Menu(downloadMenuTitle) {
+            Button(downloadBusyItemIDs.contains(item.id) ? "Downloading to App Cache…" : "Download to App Cache") {
+                Task { await downloadItem(item.id) }
+            }
+            .disabled(downloadBusyItemIDs.contains(item.id))
+
+            Button("Download To…") {
+                Task { await downloadItemToChosenLocation(item: item) }
+            }
+            .disabled(downloadBusyItemIDs.contains(item.id))
+
+            Button(openLibraryFolderActionTitle) {
+                Task { await openPreferredLibraryFolderInFinder() }
+            }
+
+            if downloadState(for: item.id) == .downloaded {
+                Divider()
+                Button("Remove Downloaded File", role: .destructive) {
+                    Task { await removeDownload(for: item.id) }
+                }
+            }
+        }
+
+        if canCopyToLocalLibrary {
+            Button("Copy to Local Library") {
+                Task { await copyItemsToLocalLibrary([item.id]) }
+            }
+        }
+
+        if viewModel.canUploadLocalItemToServer(itemID: item.id) {
+            Button("Upload to Server…") {
+                openLocalServerUploadPreview(for: item.id)
             }
         }
     }
@@ -2386,6 +2537,8 @@ struct ContentView: View {
     private var browsedItems: [ABSCore.LibraryItem] {
         let items = filteredBaseItems
         switch currentBrowseTab {
+        case .home:
+            return []
         case .books:
             return sortedBooks(items)
         case .downloaded:
@@ -2472,8 +2625,8 @@ struct ContentView: View {
     }
 
     private var currentBrowseTab: LibraryBrowseTab {
-        guard let selectedLibraryID = viewModel.selectedLibraryID else { return .books }
-        return browseTabByLibraryID[selectedLibraryID] ?? .books
+        guard let selectedLibraryID = viewModel.selectedLibraryID else { return .home }
+        return browseTabByLibraryID[selectedLibraryID] ?? .home
     }
 
     private var isBookListTab: Bool {
@@ -2483,6 +2636,8 @@ struct ContentView: View {
     private var browseGroups: [BrowseGroup] {
         let items = filteredBaseItems
         switch currentBrowseTab {
+        case .home:
+            return homeBrowseGroups(from: items)
         case .books:
             return []
         case .downloaded:
@@ -2520,11 +2675,60 @@ struct ContentView: View {
     }
 
     private var displayedBrowseGroups: [BrowseGroup] {
-        sortedGroups(browseGroups)
+        if currentBrowseTab == .home {
+            return browseGroups
+        }
+        return sortedGroups(browseGroups)
+    }
+
+    private func homeBrowseGroups(from items: [ABSCore.LibraryItem]) -> [BrowseGroup] {
+        let inProgress = items
+            .filter { item in
+                let progress = savedProgress(for: item.id)
+                guard progress > 0 else { return false }
+                if let duration = item.duration, duration > 0 {
+                    return progress < (duration - 1)
+                }
+                return true
+            }
+            .sorted {
+                let lhs = recentActivityByItemID[$0.id] ?? .distantPast
+                let rhs = recentActivityByItemID[$1.id] ?? .distantPast
+                if lhs == rhs {
+                    return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+                }
+                return lhs > rhs
+            }
+
+        let recentlyAdded = items.sorted {
+            let lhs = $0.addedAt ?? .distantPast
+            let rhs = $1.addedAt ?? .distantPast
+            if lhs == rhs {
+                return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+            }
+            return lhs > rhs
+        }
+
+        let downloads = items
+            .filter { downloadedItemIDs.contains($0.id) }
+            .sorted {
+                let lhs = downloadedAtByItemID[$0.id] ?? .distantPast
+                let rhs = downloadedAtByItemID[$1.id] ?? .distantPast
+                if lhs == rhs {
+                    return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+                }
+                return lhs > rhs
+            }
+
+        return [
+            BrowseGroup(id: "home:in-progress", title: "In Progress", subtitle: "Most recently played first", itemCount: inProgress.count, items: inProgress),
+            BrowseGroup(id: "home:recently-added", title: "Recently Added", subtitle: "Newest additions first", itemCount: recentlyAdded.count, items: recentlyAdded),
+            BrowseGroup(id: "home:downloads", title: "Downloads", subtitle: "Most recently cached first", itemCount: downloads.count, items: downloads)
+        ]
     }
 
     private func currentBrowseTab(for libraryID: String) -> LibraryBrowseTab {
-        browseTabByLibraryID[libraryID] ?? .books
+        browseTabByLibraryID[libraryID] ?? .home
     }
 
     private func selectLibrary(libraryID: String, browseTab: LibraryBrowseTab) {
@@ -2533,10 +2737,17 @@ struct ContentView: View {
 
         Task {
             await viewModel.selectLibrary(id: libraryID)
+            applySplitVisibilityForCurrentTab()
             if browseTab == .books || browseTab == .downloaded {
                 selectedItemID = browsedItems.first?.id
                 selectedItemIDs = selectedItemID.map { [$0] } ?? []
                 selectedGroupID = nil
+            } else if browseTab == .home {
+                let groups = displayedBrowseGroups
+                selectedGroupID = nil
+                let topInProgress = groups.first?.items.first?.id
+                selectedItemID = topInProgress
+                selectedItemIDs = topInProgress.map { [$0] } ?? []
             } else if browseTab == .stats {
                 selectedItemID = nil
                 selectedItemIDs = []
@@ -2552,6 +2763,7 @@ struct ContentView: View {
     private func selectCurrentLibraryBrowseTab(_ browseTab: LibraryBrowseTab) {
         guard let currentLibraryID = viewModel.selectedLibraryID else { return }
         browseTabByLibraryID[currentLibraryID] = browseTab
+        applySplitVisibilityForCurrentTab()
     }
 
     private func selectDockBrowseTab(_ browseTab: LibraryBrowseTab) {
@@ -2577,6 +2789,7 @@ struct ContentView: View {
     private func openItemFromDownloadsPopover(_ itemID: String) {
         guard viewModel.selectedLibraryID != nil else { return }
         selectCurrentLibraryBrowseTab(.books)
+        applySplitVisibilityForCurrentTab()
         selectedGroupID = nil
         selectedItemID = itemID
         selectedItemIDs = [itemID]
@@ -2870,6 +3083,15 @@ struct ContentView: View {
             selectedItemID = nil
             selectedItemIDs = []
             selectedGroupID = nil
+            return
+        }
+
+        if currentBrowseTab == .home {
+            let groups = displayedBrowseGroups
+            selectedGroupID = nil
+            let topInProgress = groups.first?.items.first?.id
+            selectedItemID = topInProgress
+            selectedItemIDs = topInProgress.map { [$0] } ?? []
             return
         }
 
@@ -3381,6 +3603,146 @@ struct ContentView: View {
         .frame(minWidth: 720, minHeight: 480)
     }
 
+    private var localServerUploadItem: ABSCore.LibraryItem? {
+        guard let localServerUploadItemID else { return nil }
+        return viewModel.item(withID: localServerUploadItemID)
+    }
+
+    private var selectedLocalServerUploadFolder: ABSCore.LibraryFolder? {
+        guard let localServerSelectedFolderID else { return nil }
+        return localServerUploadFolders.first(where: { $0.id == localServerSelectedFolderID })
+    }
+
+    private var localServerUploadPathPreview: String {
+        guard let folder = selectedLocalServerUploadFolder else { return "Select a target folder" }
+        return viewModel.previewUploadPath(
+            folder: folder,
+            author: localServerUploadDraft.author,
+            title: localServerUploadDraft.title
+        )
+    }
+
+    private var canSubmitLocalServerUpload: Bool {
+        guard !localServerUploadBusy else { return false }
+        guard localServerUploadItemID != nil else { return false }
+        guard localServerSelectedLibraryID != nil else { return false }
+        guard localServerSelectedFolderID != nil else { return false }
+        guard !localServerUploadDraft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard !localServerUploadDraft.author.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return true
+    }
+
+    private var localServerUploadPreviewSheet: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 12) {
+                Form {
+                    Section("Upload Target") {
+                        Picker("ABS Library", selection: $localServerSelectedLibraryID) {
+                            ForEach(localServerUploadLibraries, id: \.id) { library in
+                                Text(library.name).tag(Optional(library.id))
+                            }
+                        }
+                        .disabled(localServerUploadBusy || localServerUploadFolderLoading)
+
+                        Picker("ABS Folder", selection: $localServerSelectedFolderID) {
+                            ForEach(localServerUploadFolders, id: \.id) { folder in
+                                let label = folder.fullPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                                    ? folder.fullPath!
+                                    : folder.name
+                                Text(label).tag(Optional(folder.id))
+                            }
+                        }
+                        .disabled(localServerUploadBusy || localServerUploadFolderLoading || localServerUploadFolders.isEmpty)
+
+                        if localServerUploadFolderLoading {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Loading library folders…")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+
+                    Section("Metadata") {
+                        TextField("Title", text: $localServerUploadDraft.title)
+                        TextField("Author", text: $localServerUploadDraft.author)
+                    }
+
+                    Section("Upload Path Preview") {
+                        Text(localServerUploadPathPreview)
+                            .font(.callout.monospaced())
+                            .textSelection(.enabled)
+                            .foregroundStyle(selectedLocalServerUploadFolder == nil ? .secondary : .primary)
+                    }
+                }
+
+                if !localServerDuplicateMatches.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Possible Existing Items in ABS")
+                            .font(.headline)
+                        ForEach(localServerDuplicateMatches.prefix(5)) { match in
+                            Text("• \(match.item.title) — \(displayAuthorNames(for: match.item).joined(separator: ", "))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                }
+            }
+            .navigationTitle("Upload to ABS")
+            .safeAreaInset(edge: .bottom) {
+                HStack(spacing: 10) {
+                    Button("Cancel") {
+                        showingLocalServerUploadPreview = false
+                    }
+
+                    Spacer()
+
+                    Button("Upload") {
+                        Task { await handleLocalServerUploadTap() }
+                    }
+                    .disabled(!canSubmitLocalServerUpload)
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(.regularMaterial)
+            }
+            .overlay {
+                if localServerUploadBusy {
+                    ProgressView()
+                        .controlSize(.large)
+                }
+            }
+            .onChange(of: localServerSelectedLibraryID) { newValue in
+                guard let libraryID = newValue else { return }
+                Task { await loadLocalServerUploadFolders(libraryID: libraryID) }
+            }
+            .alert("Upload Error", isPresented: Binding(
+                get: { localServerUploadErrorMessage != nil },
+                set: { newValue in
+                    if !newValue { localServerUploadErrorMessage = nil }
+                }
+            )) {
+                Button("OK", role: .cancel) {
+                    localServerUploadErrorMessage = nil
+                }
+            } message: {
+                Text(localServerUploadErrorMessage ?? "Unknown error")
+            }
+            .alert("Possible Duplicate in ABS", isPresented: $showingLocalServerDuplicateWarning) {
+                Button("Cancel", role: .cancel) {}
+                Button("Upload Anyway") {
+                    Task { await submitLocalServerUpload(skipDuplicateCheck: true) }
+                }
+            } message: {
+                Text(localServerDuplicateWarningMessage())
+            }
+        }
+        .frame(minWidth: 720, minHeight: 500)
+    }
+
     private var manualMetadataMatchSearchRow: some View {
         HStack(spacing: 8) {
             TextField("Search title", text: $manualMetadataMatchQuery)
@@ -3592,6 +3954,117 @@ struct ContentView: View {
         metadataCoverURLText = ""
         metadataEditorErrorMessage = nil
         showingMetadataEditor = true
+    }
+
+    private func openLocalServerUploadPreview(for itemID: String) {
+        guard let item = viewModel.item(withID: itemID),
+              let fileURL = viewModel.localFileURL(for: itemID),
+              FileManager.default.fileExists(atPath: fileURL.path) else {
+            viewModel.setError("Local file is unavailable for upload")
+            return
+        }
+
+        let firstAuthor = displayAuthorNames(for: item).first ?? ""
+        localServerUploadItemID = itemID
+        localServerUploadDraft = LocalServerUploadDraft(
+            title: item.title,
+            author: firstAuthor
+        )
+        localServerUploadLibraries = viewModel.remoteLibrariesForUpload()
+        localServerSelectedLibraryID = localServerUploadLibraries.first?.id
+        localServerUploadFolders = []
+        localServerSelectedFolderID = nil
+        localServerUploadBusy = false
+        localServerUploadFolderLoading = false
+        localServerUploadDuplicateBusy = false
+        localServerDuplicateMatches = []
+        localServerUploadErrorMessage = nil
+
+        showingLocalServerUploadPreview = true
+
+        if let firstLibraryID = localServerSelectedLibraryID {
+            Task { await loadLocalServerUploadFolders(libraryID: firstLibraryID) }
+        }
+    }
+
+    private func loadLocalServerUploadFolders(libraryID: String) async {
+        localServerUploadFolderLoading = true
+        defer { localServerUploadFolderLoading = false }
+
+        do {
+            let folders = try await viewModel.uploadFolders(for: libraryID)
+            localServerUploadFolders = folders
+            if let first = folders.first {
+                localServerSelectedFolderID = first.id
+            } else {
+                localServerSelectedFolderID = nil
+                localServerUploadErrorMessage = "No upload folders found for the selected ABS library."
+            }
+        } catch {
+            localServerUploadFolders = []
+            localServerSelectedFolderID = nil
+            localServerUploadErrorMessage = "Failed loading ABS folders: \(viewModel.describeError(error))"
+        }
+    }
+
+    private func handleLocalServerUploadTap() async {
+        guard !localServerUploadDuplicateBusy else { return }
+        localServerUploadDuplicateBusy = true
+        defer { localServerUploadDuplicateBusy = false }
+
+        guard let libraryID = localServerSelectedLibraryID else { return }
+        let duplicates = await viewModel.detectRemoteDuplicates(
+            title: localServerUploadDraft.title,
+            author: localServerUploadDraft.author,
+            libraryID: libraryID
+        )
+        localServerDuplicateMatches = duplicates
+        if duplicates.isEmpty {
+            await submitLocalServerUpload(skipDuplicateCheck: true)
+            return
+        }
+        showingLocalServerDuplicateWarning = true
+    }
+
+    private func submitLocalServerUpload(skipDuplicateCheck: Bool) async {
+        guard canSubmitLocalServerUpload else { return }
+        guard let itemID = localServerUploadItemID,
+              let libraryID = localServerSelectedLibraryID,
+              let folderID = localServerSelectedFolderID else { return }
+
+        if !skipDuplicateCheck {
+            await handleLocalServerUploadTap()
+            return
+        }
+
+        localServerUploadBusy = true
+        defer { localServerUploadBusy = false }
+
+        do {
+            try await viewModel.uploadLocalItemToServer(
+                itemID: itemID,
+                libraryID: libraryID,
+                folderID: folderID,
+                title: localServerUploadDraft.title,
+                author: localServerUploadDraft.author
+            )
+            showingLocalServerUploadPreview = false
+        } catch {
+            localServerUploadErrorMessage = "Upload failed: \(viewModel.describeError(error))"
+        }
+    }
+
+    private func localServerDuplicateWarningMessage() -> String {
+        guard !localServerDuplicateMatches.isEmpty else {
+            return "A similar item may already exist on this ABS server."
+        }
+        let head = localServerDuplicateMatches.prefix(3).map {
+            "\($0.item.title) — \(displayAuthorNames(for: $0.item).joined(separator: ", "))"
+        }
+        let suffix = localServerDuplicateMatches.count > 3
+            ? "\n…and \(localServerDuplicateMatches.count - 3) more."
+            : ""
+        return "Potential duplicates were found:\n- \(head.joined(separator: "\n- "))\(suffix)\n\nUpload anyway?"
     }
 
     private func metadataEditorDraft(from item: ABSCore.LibraryItem) -> MetadataEditorDraft {
@@ -4793,9 +5266,31 @@ struct ContentView: View {
     }
 
     private func updateSplitVisibility(for totalWidth: CGFloat) {
+        currentWindowWidth = totalWidth
+        if currentBrowseTab == .home {
+            splitVisibility = .all
+            return
+        }
         // Collapse detail column when the app is too narrow to keep
         // right-panel text readable.
         splitVisibility = totalWidth < 1120 ? .doubleColumn : .all
+    }
+
+    private func applySplitVisibilityForCurrentTab() {
+        updateSplitVisibility(for: currentWindowWidth)
+    }
+
+    private var homeAwareSplitVisibility: Binding<NavigationSplitViewVisibility> {
+        Binding(
+            get: { currentBrowseTab == .home ? .all : splitVisibility },
+            set: { newValue in
+                if currentBrowseTab == .home {
+                    splitVisibility = .all
+                } else {
+                    splitVisibility = newValue
+                }
+            }
+        )
     }
 
     private func configurePlayerObservers() {
@@ -4923,15 +5418,9 @@ struct ContentView: View {
                 showingServerSheet = false
                 await recoverPendingDownloadsIfNeeded()
                 if let selectedLibraryID = viewModel.selectedLibraryID, browseTabByLibraryID[selectedLibraryID] == nil {
-                    browseTabByLibraryID[selectedLibraryID] = .books
+                    browseTabByLibraryID[selectedLibraryID] = .home
                 }
-                if isBookListTab {
-                    selectedItemID = browsedItems.first?.id
-                    selectedGroupID = nil
-                } else {
-                    selectedGroupID = displayedBrowseGroups.first?.id
-                    selectedItemID = nil
-                }
+                refreshSelectionForCurrentBrowseContext()
                 updateNowPlaying()
             }
         }
@@ -4958,15 +5447,9 @@ struct ContentView: View {
                     viewModel.selectedLibraryID = viewModel.libraries.first?.id
                 }
                 if let selectedLibraryID = viewModel.selectedLibraryID, browseTabByLibraryID[selectedLibraryID] == nil {
-                    browseTabByLibraryID[selectedLibraryID] = .books
+                    browseTabByLibraryID[selectedLibraryID] = .home
                 }
-                if isBookListTab {
-                    selectedItemID = browsedItems.first?.id
-                    selectedGroupID = nil
-                } else {
-                    selectedGroupID = displayedBrowseGroups.first?.id
-                    selectedItemID = nil
-                }
+                refreshSelectionForCurrentBrowseContext()
             } catch {
                 viewModel.setError("Failed to add local folder: \(viewModel.describeError(error))")
             }
@@ -4977,13 +5460,7 @@ struct ContentView: View {
         Task {
             do {
                 try await viewModel.rescanLocalLibraries()
-                if isBookListTab {
-                    selectedItemID = browsedItems.first?.id
-                    selectedGroupID = nil
-                } else {
-                    selectedGroupID = displayedBrowseGroups.first?.id
-                    selectedItemID = nil
-                }
+                refreshSelectionForCurrentBrowseContext()
             } catch {
                 viewModel.setError("Failed to rescan local libraries: \(viewModel.describeError(error))")
             }
@@ -5476,6 +5953,7 @@ struct ContentView: View {
 
     private func refreshDownloadedInventory() async {
         downloadedItemIDs = await viewModel.downloadedItemIDs()
+        downloadedAtByItemID = await viewModel.downloadedAtByItemID()
     }
 
     private func refreshDownloadStates(for itemIDs: [String]) async {
@@ -5629,6 +6107,7 @@ struct ContentView: View {
         do {
             try await viewModel.clearAllDownloads()
             downloadedItemIDs.removeAll()
+            downloadedAtByItemID.removeAll()
             downloadQueuedItemIDs.removeAll()
             downloadProgressByItemID.removeAll()
             downloadRecoveredStateByItemID.removeAll()
@@ -5698,6 +6177,7 @@ struct ContentView: View {
         favoriteItemIDs = []
         recentActivityByItemID = [:]
         downloadedItemIDs = []
+        downloadedAtByItemID = [:]
         downloadStateByItemID = [:]
         downloadBusyItemIDs = []
         downloadQueuedItemIDs = []

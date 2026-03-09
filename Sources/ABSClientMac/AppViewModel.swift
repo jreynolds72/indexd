@@ -30,6 +30,11 @@ final class AppViewModel: ObservableObject {
         let imageURL: URL
     }
 
+    struct RemoteUploadDuplicate: Identifiable, Sendable {
+        let id: String
+        let item: ABSCore.LibraryItem
+    }
+
     private enum DownloadFeatureError: LocalizedError {
         case unavailable
 
@@ -51,6 +56,26 @@ final class AppViewModel: ObservableObject {
                 return "Item is already in a local library"
             case .localRootUnavailable:
                 return "Selected local library folder is unavailable"
+            }
+        }
+    }
+
+    private enum LocalUploadError: LocalizedError {
+        case notLocalItem
+        case missingLocalFile
+        case notConnected
+        case missingRequiredMetadata
+
+        var errorDescription: String? {
+            switch self {
+            case .notLocalItem:
+                return "Only local library items can be uploaded"
+            case .missingLocalFile:
+                return "Local file is unavailable for upload"
+            case .notConnected:
+                return "Connect to an ABS server before uploading"
+            case .missingRequiredMetadata:
+                return "Title and author are required for upload"
             }
         }
     }
@@ -336,6 +361,12 @@ final class AppViewModel: ObservableObject {
         return Set(await downloadManager.allDownloads().map(\.itemID))
     }
 
+    func downloadedAtByItemID() async -> [String: Date] {
+        guard let downloadManager else { return [:] }
+        let records = await downloadManager.allDownloads()
+        return Dictionary(uniqueKeysWithValues: records.map { ($0.itemID, $0.downloadedAt) })
+    }
+
     func queueDownloadJob(itemID: String) async {
         guard let downloadManager else { return }
         let itemMetadata = item(withID: itemID)
@@ -543,6 +574,114 @@ final class AppViewModel: ObservableObject {
     func canEditMetadata(itemID: String) -> Bool {
         guard let item = item(withID: itemID) else { return false }
         return item.libraryID.hasPrefix(LocalLibraryManager.libraryIDPrefix)
+    }
+
+    func remoteLibrariesForUpload() -> [ABSCore.Library] {
+        libraries.filter { !isLocalLibrary(id: $0.id) }
+    }
+
+    func localFileURL(for itemID: String) -> URL? {
+        localFileURLByItemID[itemID]
+    }
+
+    func canUploadLocalItemToServer(itemID: String) -> Bool {
+        guard isAuthenticated, apiClient != nil else { return false }
+        guard let item = item(withID: itemID) else { return false }
+        guard item.libraryID.hasPrefix(LocalLibraryManager.libraryIDPrefix) else { return false }
+        guard localFileURLByItemID[itemID] != nil else { return false }
+        guard !remoteLibrariesForUpload().isEmpty else { return false }
+
+        let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let authors = item.authors
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return !title.isEmpty && !authors.isEmpty
+    }
+
+    func uploadFolders(for libraryID: String) async throws -> [ABSCore.LibraryFolder] {
+        guard let apiClient else { throw LocalUploadError.notConnected }
+        return try await apiClient.libraryFolders(in: libraryID)
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func previewUploadPath(folder: ABSCore.LibraryFolder, author: String, title: String) -> String {
+        var components: [String] = []
+        if let fullPath = folder.fullPath?.trimmingCharacters(in: .whitespacesAndNewlines), !fullPath.isEmpty {
+            components.append(fullPath)
+        } else {
+            components.append(folder.name)
+        }
+        components.append(sanitizedPathComponent(author))
+        components.append(sanitizedPathComponent(title))
+        return components.joined(separator: "/")
+    }
+
+    func detectRemoteDuplicates(
+        title: String,
+        author: String,
+        libraryID: String
+    ) async -> [RemoteUploadDuplicate] {
+        guard let apiClient else { return [] }
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAuthor = author.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty, !trimmedAuthor.isEmpty else { return [] }
+
+        do {
+            let searchResults = try await apiClient.search(query: trimmedTitle, in: libraryID)
+            let titleNeedle = normalizedToken(trimmedTitle)
+            let authorNeedle = normalizedToken(trimmedAuthor)
+
+            var seen = Set<String>()
+            var matches: [RemoteUploadDuplicate] = []
+            for candidate in searchResults {
+                let candidateTitle = normalizedToken(candidate.title)
+                let candidateAuthorNames = (candidate.authors + [candidate.author ?? ""])
+                    .map(normalizedToken)
+                    .filter { !$0.isEmpty }
+
+                let titleMatches = !titleNeedle.isEmpty && candidateTitle.contains(titleNeedle)
+                let authorMatches = candidateAuthorNames.contains { $0.contains(authorNeedle) || authorNeedle.contains($0) }
+                guard titleMatches && authorMatches else { continue }
+                guard seen.insert(candidate.id).inserted else { continue }
+                matches.append(RemoteUploadDuplicate(id: candidate.id, item: candidate))
+            }
+            return matches
+        } catch {
+            return []
+        }
+    }
+
+    func uploadLocalItemToServer(
+        itemID: String,
+        libraryID: String,
+        folderID: String,
+        title: String,
+        author: String
+    ) async throws {
+        guard let apiClient else { throw LocalUploadError.notConnected }
+        guard let item = item(withID: itemID),
+              item.libraryID.hasPrefix(LocalLibraryManager.libraryIDPrefix) else {
+            throw LocalUploadError.notLocalItem
+        }
+        guard let fileURL = localFileURLByItemID[itemID],
+              FileManager.default.fileExists(atPath: fileURL.path) else {
+            throw LocalUploadError.missingLocalFile
+        }
+
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAuthor = author.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty, !trimmedAuthor.isEmpty else {
+            throw LocalUploadError.missingRequiredMetadata
+        }
+
+        try await apiClient.uploadItem(
+            localFileURL: fileURL,
+            libraryID: libraryID,
+            folderID: folderID,
+            title: trimmedTitle,
+            author: trimmedAuthor,
+            series: nil
+        )
     }
 
     @discardableResult
@@ -1454,6 +1593,18 @@ final class AppViewModel: ObservableObject {
         } else {
             serverPortText = String(defaultABSPort)
         }
+    }
+
+    private func sanitizedPathComponent(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "Unknown" }
+        let invalid = CharacterSet(charactersIn: "/:\\")
+        let pieces = trimmed.components(separatedBy: invalid).filter { !$0.isEmpty }
+        return pieces.joined(separator: "-")
+    }
+
+    private func normalizedToken(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private func describe(_ error: Error) -> String {

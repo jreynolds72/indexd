@@ -10,6 +10,18 @@ public struct Library: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+public struct LibraryFolder: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let name: String
+    public let fullPath: String?
+
+    public init(id: String, name: String, fullPath: String? = nil) {
+        self.id = id
+        self.name = name
+        self.fullPath = fullPath
+    }
+}
+
 public struct Chapter: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let title: String
@@ -39,6 +51,7 @@ public struct LibraryItem: Codable, Equatable, Identifiable, Sendable {
     public let publisher: String?
     public let publishedYear: Int?
     public let language: String?
+    public let addedAt: Date?
     public let libraryID: String
     public let duration: TimeInterval?
     public let chapters: [Chapter]
@@ -58,6 +71,7 @@ public struct LibraryItem: Codable, Equatable, Identifiable, Sendable {
         publisher: String? = nil,
         publishedYear: Int? = nil,
         language: String? = nil,
+        addedAt: Date? = nil,
         libraryID: String,
         duration: TimeInterval?,
         chapters: [Chapter]
@@ -76,6 +90,7 @@ public struct LibraryItem: Codable, Equatable, Identifiable, Sendable {
         self.publisher = publisher
         self.publishedYear = publishedYear
         self.language = language
+        self.addedAt = addedAt
         self.libraryID = libraryID
         self.duration = duration
         self.chapters = chapters
