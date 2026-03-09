@@ -187,6 +187,51 @@ public actor ABSAPIClient {
         try await authenticatedGET(path: "api/items/\(itemID)/cover")
     }
 
+    public func libraryFolders(in libraryID: String) async throws -> [LibraryFolder] {
+        let data = try await authenticatedGET(path: "api/libraries/\(libraryID)")
+
+        if let detail = try? decoder.decode(LibraryDetailDTO.self, from: data) {
+            return detail.folders.map { $0.toDomain() }
+        }
+
+        struct Wrapper: Decodable {
+            let library: LibraryDetailDTO?
+        }
+        if let wrapper = try? decoder.decode(Wrapper.self, from: data),
+           let detail = wrapper.library {
+            return detail.folders.map { $0.toDomain() }
+        }
+
+        logger.error("Failed to decode library folders for \(libraryID, privacy: .public): \(self.debugPayload(data), privacy: .public)")
+        throw APIError.decodeFailure
+    }
+
+    public func uploadItem(
+        localFileURL: URL,
+        libraryID: String,
+        folderID: String,
+        title: String,
+        author: String?,
+        series: String?
+    ) async throws {
+        let fileData = try Data(contentsOf: localFileURL)
+        let boundary = "----indexdUpload\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
+        var request = URLRequest(url: baseURL.appending(path: "api/upload"))
+        request.httpMethod = "POST"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.httpBody = multipartUploadBody(
+            boundary: boundary,
+            fileData: fileData,
+            fileURL: localFileURL,
+            libraryID: libraryID,
+            folderID: folderID,
+            title: title,
+            author: author,
+            series: series
+        )
+        _ = try await sendAuthenticated(request)
+    }
+
     public func probeLiveTransportSupport() async -> LiveTransportProbeResult {
         let token = try? await authSession.accessToken()
 
@@ -485,6 +530,46 @@ public actor ABSAPIClient {
         return text
     }
 
+    private func multipartUploadBody(
+        boundary: String,
+        fileData: Data,
+        fileURL: URL,
+        libraryID: String,
+        folderID: String,
+        title: String,
+        author: String?,
+        series: String?
+    ) -> Data {
+        var body = Data()
+        let lineBreak = "\r\n"
+
+        func appendTextField(name: String, value: String) {
+            body.append("--\(boundary)\(lineBreak)")
+            body.append("Content-Disposition: form-data; name=\"\(name)\"\(lineBreak)\(lineBreak)")
+            body.append("\(value)\(lineBreak)")
+        }
+
+        appendTextField(name: "title", value: title)
+        appendTextField(name: "library", value: libraryID)
+        appendTextField(name: "folder", value: folderID)
+        if let author, !author.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            appendTextField(name: "author", value: author.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        if let series, !series.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            appendTextField(name: "series", value: series.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        let fileName = fileURL.lastPathComponent.isEmpty ? "upload.m4b" : fileURL.lastPathComponent
+        let mimeType = "application/octet-stream"
+        body.append("--\(boundary)\(lineBreak)")
+        body.append("Content-Disposition: form-data; name=\"0\"; filename=\"\(fileName)\"\(lineBreak)")
+        body.append("Content-Type: \(mimeType)\(lineBreak)\(lineBreak)")
+        body.append(fileData)
+        body.append(lineBreak)
+        body.append("--\(boundary)--\(lineBreak)")
+        return body
+    }
+
     private func websocketConnectURL() -> URL {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
         components?.scheme = baseURL.scheme == "https" ? "wss" : "ws"
@@ -692,12 +777,92 @@ public actor ABSAPIClient {
     }
 }
 
+private extension Data {
+    mutating func append(_ string: String) {
+        append(Data(string.utf8))
+    }
+}
+
 private struct LibraryDTO: Decodable {
     let id: String
     let name: String
 
     func toDomain() -> Library {
         Library(id: id, name: name)
+    }
+}
+
+private struct LibraryDetailDTO: Decodable {
+    let folders: [LibraryFolderDTO]
+
+    enum CodingKeys: String, CodingKey {
+        case folders
+        case libraryFolders
+        case mediaFolders
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        folders = (try? c.decodeIfPresent([LibraryFolderDTO].self, forKey: .folders)) ?? []
+            + ((try? c.decodeIfPresent([LibraryFolderDTO].self, forKey: .libraryFolders)) ?? [])
+            + ((try? c.decodeIfPresent([LibraryFolderDTO].self, forKey: .mediaFolders)) ?? [])
+    }
+}
+
+private struct LibraryFolderDTO: Decodable {
+    let id: String
+    let name: String
+    let fullPath: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case fullPath
+        case path
+        case folderPath
+        case dirname
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = LibraryFolderDTO.decodeID(from: c, key: .id) ?? UUID().uuidString
+
+        let resolvedPath = LibraryFolderDTO.firstNonEmptyString([
+            try? c.decodeIfPresent(String.self, forKey: .fullPath),
+            try? c.decodeIfPresent(String.self, forKey: .folderPath),
+            try? c.decodeIfPresent(String.self, forKey: .path)
+        ])
+        let resolvedName = LibraryFolderDTO.firstNonEmptyString([
+            try? c.decodeIfPresent(String.self, forKey: .name),
+            try? c.decodeIfPresent(String.self, forKey: .dirname),
+            resolvedPath?.split(separator: "/").last.map(String.init)
+        ])
+        name = resolvedName ?? "Folder"
+        fullPath = resolvedPath
+    }
+
+    func toDomain() -> LibraryFolder {
+        LibraryFolder(id: id, name: name, fullPath: fullPath)
+    }
+
+    private static func decodeID(from container: KeyedDecodingContainer<CodingKeys>, key: CodingKeys) -> String? {
+        if let value = (try? container.decodeIfPresent(String.self, forKey: key)) ?? nil,
+           !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return value
+        }
+        if let intValue = (try? container.decodeIfPresent(Int.self, forKey: key)) ?? nil {
+            return String(intValue)
+        }
+        return nil
+    }
+
+    private static func firstNonEmptyString(_ candidates: [String?]) -> String? {
+        for candidate in candidates {
+            if let candidate, !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return nil
     }
 }
 
@@ -928,6 +1093,7 @@ private struct LibraryItemDTO: Decodable {
     let publisher: String?
     let publishedYear: Int?
     let language: String?
+    let addedAt: Date?
     let duration: TimeInterval?
     let chapters: [ChapterDTO]?
 
@@ -951,6 +1117,10 @@ private struct LibraryItemDTO: Decodable {
         case publishYear
         case year
         case language
+        case addedAt
+        case createdAt
+        case mtimeMs
+        case ctimeMs
         case duration
         case chapters
         case media
@@ -1017,6 +1187,11 @@ private struct LibraryItemDTO: Decodable {
             (try? c.decodeIfPresent(String.self, forKey: .language)) ?? nil,
             metadata?.language
         ])
+        addedAt = Self.decodeFlexibleDate(
+            from: c,
+            dateKeys: [.addedAt, .createdAt],
+            millisKeys: [.mtimeMs, .ctimeMs]
+        )
         duration = ((try? c.decodeIfPresent(TimeInterval.self, forKey: .duration)) ?? nil)
             ?? media?.duration
         chapters = ((try? c.decodeIfPresent([ChapterDTO].self, forKey: .chapters)) ?? nil)
@@ -1043,6 +1218,7 @@ private struct LibraryItemDTO: Decodable {
             publisher: publisher,
             publishedYear: publishedYear,
             language: language,
+            addedAt: addedAt,
             libraryID: libraryID,
             duration: duration,
             chapters: mappedChapters
@@ -1074,6 +1250,44 @@ private struct LibraryItemDTO: Decodable {
             .replacingOccurrences(of: " and ", with: ",", options: .caseInsensitive)
             .replacingOccurrences(of: ";", with: ",")
         return normalized.components(separatedBy: ",")
+    }
+
+    private static func decodeFlexibleDate(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        dateKeys: [CodingKeys],
+        millisKeys: [CodingKeys]
+    ) -> Date? {
+        for key in dateKeys {
+            if let seconds = (try? container.decodeIfPresent(Double.self, forKey: key)) ?? nil {
+                return seconds > 4_000_000_000
+                    ? Date(timeIntervalSince1970: seconds / 1000)
+                    : Date(timeIntervalSince1970: seconds)
+            }
+            if let intSeconds = (try? container.decodeIfPresent(Int64.self, forKey: key)) ?? nil {
+                return intSeconds > 4_000_000_000
+                    ? Date(timeIntervalSince1970: Double(intSeconds) / 1000)
+                    : Date(timeIntervalSince1970: Double(intSeconds))
+            }
+            if let text = (try? container.decodeIfPresent(String.self, forKey: key)) ?? nil {
+                if let numeric = Double(text) {
+                    return numeric > 4_000_000_000
+                        ? Date(timeIntervalSince1970: numeric / 1000)
+                        : Date(timeIntervalSince1970: numeric)
+                }
+                if let parsed = ISO8601DateFormatter().date(from: text) {
+                    return parsed
+                }
+            }
+        }
+        for key in millisKeys {
+            if let millis = (try? container.decodeIfPresent(Double.self, forKey: key)) ?? nil {
+                return Date(timeIntervalSince1970: millis / 1000)
+            }
+            if let intMillis = (try? container.decodeIfPresent(Int64.self, forKey: key)) ?? nil {
+                return Date(timeIntervalSince1970: Double(intMillis) / 1000)
+            }
+        }
+        return nil
     }
 
     private static func normalizedPeopleNames(_ values: [String]) -> [String] {
