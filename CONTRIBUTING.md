@@ -22,6 +22,12 @@ Optional local auth behavior used during development:
 ABS_DEV_LOCAL_AUTH_STORE=1 swift run indexd
 ```
 
+Dev Launch Command (team convention):
+
+```bash
+cd "/Users/joshreynolds/Library/CloudStorage/OneDrive-HEIFERPROJECTINTERNATIONAL/Documents/Codex/ABS Client" && git checkout <branch-name> && ABS_DEV_LOCAL_AUTH_STORE=1 swift run indexd
+```
+
 ## Pull Requests
 
 1. Create a branch from `main`.

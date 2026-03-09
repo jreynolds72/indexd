@@ -44,6 +44,12 @@ For local dev auth bypass behavior used during development:
 ABS_DEV_LOCAL_AUTH_STORE=1 swift run indexd
 ```
 
+Dev Launch Command (project convention):
+
+```bash
+cd "/Users/joshreynolds/Library/CloudStorage/OneDrive-HEIFERPROJECTINTERNATIONAL/Documents/Codex/ABS Client" && git checkout <branch-name> && ABS_DEV_LOCAL_AUTH_STORE=1 swift run indexd
+```
+
 ## Packaging
 
 Build release binary:
