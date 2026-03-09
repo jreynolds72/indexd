@@ -676,6 +676,10 @@ struct ContentView: View {
             if let selectedLibraryID = viewModel.selectedLibraryID, browseTabByLibraryID[selectedLibraryID] == nil {
                 browseTabByLibraryID[selectedLibraryID] = .home
             }
+            mediaIntegration.updateSkipIntervals(
+                backwardSeconds: preferences.skipBackwardSeconds,
+                forwardSeconds: preferences.skipForwardSeconds
+            )
             applySplitVisibilityForCurrentTab()
             refreshSelectionForCurrentBrowseContext()
             configurePlayerObservers()
@@ -780,6 +784,20 @@ struct ContentView: View {
                 player.rate = Float(newSpeed)
             }
             updateNowPlaying()
+        }))
+
+        view = AnyView(view.onChange(of: preferences.skipBackwardSeconds, perform: { newValue in
+            mediaIntegration.updateSkipIntervals(
+                backwardSeconds: newValue,
+                forwardSeconds: preferences.skipForwardSeconds
+            )
+        }))
+
+        view = AnyView(view.onChange(of: preferences.skipForwardSeconds, perform: { newValue in
+            mediaIntegration.updateSkipIntervals(
+                backwardSeconds: preferences.skipBackwardSeconds,
+                forwardSeconds: newValue
+            )
         }))
 
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .absMediaPlay)) { _ in

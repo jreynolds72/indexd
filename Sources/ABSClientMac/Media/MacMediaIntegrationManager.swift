@@ -34,6 +34,8 @@ final class MacMediaIntegrationManager {
 
     private var commandTokens: [Any] = []
     private var configured = false
+    private var skipBackwardInterval: NSNumber = 15
+    private var skipForwardInterval: NSNumber = 30
 
     private init() {}
 
@@ -81,6 +83,15 @@ final class MacMediaIntegrationManager {
         nowPlayingInfoCenter.playbackState = .stopped
     }
 
+    func updateSkipIntervals(backwardSeconds: Double, forwardSeconds: Double) {
+        let clampedBackward = max(1, Int(backwardSeconds.rounded()))
+        let clampedForward = max(1, Int(forwardSeconds.rounded()))
+        skipBackwardInterval = NSNumber(value: clampedBackward)
+        skipForwardInterval = NSNumber(value: clampedForward)
+        commandCenter.skipBackwardCommand.preferredIntervals = [skipBackwardInterval]
+        commandCenter.skipForwardCommand.preferredIntervals = [skipForwardInterval]
+    }
+
     func notifyDownloadComplete(title: String) {
         guard let notificationCenter else { return }
 
@@ -117,14 +128,24 @@ final class MacMediaIntegrationManager {
             return .success
         }
 
-        commandCenter.skipBackwardCommand.preferredIntervals = [15]
+        commandCenter.skipBackwardCommand.preferredIntervals = [skipBackwardInterval]
         let skipBack = commandCenter.skipBackwardCommand.addTarget { _ in
             NotificationCenter.default.post(name: .absMediaSkipBackward, object: nil)
             return .success
         }
 
-        commandCenter.skipForwardCommand.preferredIntervals = [30]
+        commandCenter.skipForwardCommand.preferredIntervals = [skipForwardInterval]
         let skipForward = commandCenter.skipForwardCommand.addTarget { _ in
+            NotificationCenter.default.post(name: .absMediaSkipForward, object: nil)
+            return .success
+        }
+
+        let previousTrack = commandCenter.previousTrackCommand.addTarget { _ in
+            NotificationCenter.default.post(name: .absMediaSkipBackward, object: nil)
+            return .success
+        }
+
+        let nextTrack = commandCenter.nextTrackCommand.addTarget { _ in
             NotificationCenter.default.post(name: .absMediaSkipForward, object: nil)
             return .success
         }
@@ -134,8 +155,10 @@ final class MacMediaIntegrationManager {
         commandCenter.togglePlayPauseCommand.isEnabled = true
         commandCenter.skipBackwardCommand.isEnabled = true
         commandCenter.skipForwardCommand.isEnabled = true
+        commandCenter.previousTrackCommand.isEnabled = true
+        commandCenter.nextTrackCommand.isEnabled = true
 
-        commandTokens = [play, pause, toggle, skipBack, skipForward]
+        commandTokens = [play, pause, toggle, skipBack, skipForward, previousTrack, nextTrack]
     }
 
     private func requestNotificationAuthorizationIfNeeded() {
