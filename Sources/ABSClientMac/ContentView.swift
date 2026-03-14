@@ -5896,6 +5896,7 @@ struct ContentView: View {
             // does not emit an item-progress event for a given action.
             let selectedItemReconcileIntervalWithLiveTransport: Duration = .seconds(3)
             let fallbackPollingInterval: Duration = .seconds(15)
+            let liveTransportContextReconcileEveryTicks = 5
             var tick = 0
             while !Task.isCancelled {
                 let shouldRunNow = await MainActor.run { scenePhase == .active && viewModel.isAuthenticated }
@@ -5905,7 +5906,14 @@ struct ContentView: View {
                         await performLiveUpdateTick(refreshLibraries: refreshLibraries)
                         try? await Task.sleep(for: fallbackPollingInterval)
                     } else {
-                        await syncSelectedItemProgressFromServer()
+                        let shouldReconcileContext = (tick % liveTransportContextReconcileEveryTicks) == 0
+                        if shouldReconcileContext {
+                            let refreshLibraries = (tick % (liveTransportContextReconcileEveryTicks * 4)) == 0
+                            await performLiveUpdateTick(refreshLibraries: refreshLibraries)
+                        } else {
+                            await viewModel.reconcilePendingRemoteLibraries()
+                            await syncSelectedItemProgressFromServer()
+                        }
                         try? await Task.sleep(for: selectedItemReconcileIntervalWithLiveTransport)
                     }
                     tick += 1
@@ -5937,6 +5945,7 @@ struct ContentView: View {
             // Keep library metadata current without replacing the currently filtered list.
             try? await viewModel.refreshLibrariesMetadataOnly()
         }
+        await viewModel.reconcilePendingRemoteLibraries()
         // Always refresh the current browse/search context in one pass.
         await viewModel.liveRefreshCurrentContext(searchQuery: currentSearchQuery)
         if let selectedID {
@@ -6505,33 +6514,43 @@ struct ContentView: View {
 
     private func preloadCoverForPlaybackItem() async {
         guard let item = playbackDisplayItem else { return }
-        guard coverImagesByItemID[item.id] == nil else { return }
+        if coverImagesByItemID[item.id] != nil,
+           !viewModel.shouldRefreshRemoteCover(for: item.id) {
+            updateNowPlaying()
+            return
+        }
         guard let data = await viewModel.coverData(for: item.id) else { return }
         guard let image = NSImage(data: data) else { return }
 
-        await MainActor.run {
-            coverImagesByItemID[item.id] = image
-            updateNowPlaying()
-        }
+        await storeCachedCoverImage(image, for: item.id, updateNowPlayingAfterward: true)
     }
 
     private func preloadCoverForItemID(_ itemID: String) async {
-        guard coverImagesByItemID[itemID] == nil else { return }
+        if let _ = coverImagesByItemID[itemID],
+           !viewModel.shouldRefreshRemoteCover(for: itemID) {
+            return
+        }
         guard let data = await viewModel.coverData(for: itemID) else { return }
         guard let image = NSImage(data: data) else { return }
-        await MainActor.run {
-            coverImagesByItemID[itemID] = image
-        }
+        await storeCachedCoverImage(image, for: itemID)
     }
 
     private func preloadCoverForSelectedItem() async {
         guard let item = selectedItem else { return }
-        guard coverImagesByItemID[item.id] == nil else { return }
+        if let _ = coverImagesByItemID[item.id],
+           !viewModel.shouldRefreshRemoteCover(for: item.id) {
+            return
+        }
         guard let data = await viewModel.coverData(for: item.id) else { return }
         guard let image = NSImage(data: data) else { return }
+        await storeCachedCoverImage(image, for: item.id)
+    }
 
-        await MainActor.run {
-            coverImagesByItemID[item.id] = image
+    @MainActor
+    private func storeCachedCoverImage(_ image: NSImage, for itemID: String, updateNowPlayingAfterward: Bool = false) {
+        coverImagesByItemID[itemID] = image
+        if updateNowPlayingAfterward {
+            updateNowPlaying()
         }
     }
 
