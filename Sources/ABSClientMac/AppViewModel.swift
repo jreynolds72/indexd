@@ -100,11 +100,14 @@ final class AppViewModel: ObservableObject {
     private let defaults = UserDefaults.standard
     private let serverDefaultsKey = "abs.server.url"
     private let defaultABSPort = 13378
+    private let remoteCoverCacheLifetime: TimeInterval = 15
 
     private var itemsByLibrary: [String: [ABSCore.LibraryItem]] = [:]
     private var coverDataByItemID: [String: Data] = [:]
+    private var coverDataFetchedAtByItemID: [String: Date] = [:]
     private var localLibraryIDs: Set<String> = []
     private var localFileURLByItemID: [String: URL] = [:]
+    private var pendingRemoteLibraryReconciliations: [String: Date] = [:]
     private var apiClient: ABSAPIClient?
     private let downloadManager: DownloadManager?
     private let directDownloadTransport: DownloadTransport
@@ -321,6 +324,29 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    func reconcilePendingRemoteLibraries() async {
+        guard apiClient != nil else {
+            pendingRemoteLibraryReconciliations.removeAll()
+            return
+        }
+
+        let now = Date()
+        let libraryIDs = pendingRemoteLibraryReconciliations.compactMap { libraryID, deadline in
+            deadline > now ? libraryID : nil
+        }
+        pendingRemoteLibraryReconciliations = pendingRemoteLibraryReconciliations.filter { _, deadline in
+            deadline > now
+        }
+
+        for libraryID in libraryIDs {
+            do {
+                try await refreshRemoteLibraryItems(libraryID: libraryID)
+            } catch {
+                // Keep the app responsive while remote reconciliation retries on later ticks.
+            }
+        }
+    }
+
     func liveUpdateEvents() async -> AsyncThrowingStream<Void, Error>? {
         guard isAuthenticated, let apiClient else { return nil }
         return await apiClient.liveUpdateEvents(preferred: liveTransportProbe?.recommended)
@@ -473,7 +499,8 @@ final class AppViewModel: ObservableObject {
     }
 
     func coverData(for itemID: String) async -> Data? {
-        if let cached = coverDataByItemID[itemID] {
+        if let cached = coverDataByItemID[itemID],
+           !shouldRefreshRemoteCover(for: itemID) {
             return cached
         }
 
@@ -482,10 +509,17 @@ final class AppViewModel: ObservableObject {
         do {
             let data = try await apiClient.coverData(for: itemID)
             coverDataByItemID[itemID] = data
+            coverDataFetchedAtByItemID[itemID] = Date()
             return data
         } catch {
             return nil
         }
+    }
+
+    func shouldRefreshRemoteCover(for itemID: String, now: Date = Date()) -> Bool {
+        guard !isLocalItem(itemID: itemID) else { return false }
+        guard let fetchedAt = coverDataFetchedAtByItemID[itemID] else { return true }
+        return now.timeIntervalSince(fetchedAt) >= remoteCoverCacheLifetime
     }
 
     func item(withID itemID: String) -> ABSCore.LibraryItem? {
@@ -682,6 +716,13 @@ final class AppViewModel: ObservableObject {
             author: trimmedAuthor,
             series: nil
         )
+
+        scheduleRemoteLibraryReconciliation(for: libraryID)
+        do {
+            try await refreshRemoteLibraryItems(libraryID: libraryID)
+        } catch {
+            // Upload already succeeded; keep background reconciliation active and surface no extra error.
+        }
     }
 
     @discardableResult
@@ -1145,6 +1186,17 @@ final class AppViewModel: ObservableObject {
         displayedItems = items
     }
 
+    private func refreshRemoteLibraryItems(libraryID: String) async throws {
+        guard !isLocalLibrary(id: libraryID) else { return }
+        guard let apiClient else { return }
+
+        let items = try await apiClient.items(in: libraryID)
+        itemsByLibrary[libraryID] = items
+        if selectedLibraryID == libraryID {
+            displayedItems = items
+        }
+    }
+
     private func uniqueDestinationURL(in directory: URL, itemID: String, remoteURL: URL) -> URL {
         let ext = remoteURL.pathExtension.isEmpty ? "m4b" : remoteURL.pathExtension
         let fallbackName = "book-\(itemID)"
@@ -1404,6 +1456,7 @@ final class AppViewModel: ObservableObject {
         }
         for localItemID in previousLocalItemIDs {
             coverDataByItemID.removeValue(forKey: localItemID)
+            coverDataFetchedAtByItemID.removeValue(forKey: localItemID)
         }
 
         for (libraryID, items) in snapshot.itemsByLibrary {
@@ -1411,6 +1464,7 @@ final class AppViewModel: ObservableObject {
         }
         for (itemID, data) in snapshot.coverDataByItemID {
             coverDataByItemID[itemID] = data
+            coverDataFetchedAtByItemID[itemID] = Date()
         }
 
         let remoteLibraries = libraries.filter { !isLocalLibrary(id: $0.id) }
@@ -1448,6 +1502,17 @@ final class AppViewModel: ObservableObject {
         return (remote + localLibraries).sorted { lhs, rhs in
             lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
         }
+    }
+
+    private func scheduleRemoteLibraryReconciliation(for libraryID: String) {
+        guard !isLocalLibrary(id: libraryID) else { return }
+        pendingRemoteLibraryReconciliations[libraryID] = Date().addingTimeInterval(180)
+        itemsByLibrary.removeValue(forKey: libraryID)
+    }
+
+    private func isLocalItem(itemID: String) -> Bool {
+        guard let item = item(withID: itemID) else { return false }
+        return isLocalLibrary(id: item.libraryID)
     }
 
     private func isLocalLibrary(id: String?) -> Bool {
